@@ -1,0 +1,329 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8"/>
+  <title>BingX DCA Bot</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <link rel="stylesheet" href="/static/main.css"/>
+</head>
+<body>
+  <div class="wrap">
+    <h1>BingX DCA Bot</h1>
+
+    <div class="grid">
+      <!-- 설정 -->
+      <section class="card">
+        <h2>설정</h2>
+
+        <div class="row">
+          <label>심볼</label>
+          <select id="symbol"></select>
+        </div>
+
+        <div class="row">
+          <label>진입 방향</label>
+          <select id="side">
+            <option value="BUY">BUY (롱)</option>
+            <option value="SELL">SELL (숏)</option>
+          </select>
+        </div>
+
+        <div class="row">
+          <label>마진 모드</label>
+          <select id="margin_mode">
+            <option value="CROSS">CROSS</option>
+            <option value="ISOLATED">ISOLATED</option>
+          </select>
+        </div>
+
+        <div class="row">
+          <label>레버리지</label>
+          <input id="leverage" type="number" min="1" max="125" value="10"/>
+        </div>
+
+        <div class="row">
+          <label>TP(익절 %)</label>
+          <input id="tp_percent" type="number" step="0.1" value="4.5"/>
+        </div>
+
+        <h3>DCA (최대 20차)</h3>
+        <p class="hint">
+          <b>#1</b>은 <span style="color:lightgreen">시장가</span>로 진입하며 <b>금액(USDT)</b>만 사용합니다.<br/>
+          <b>#2</b>부터는 <b>누적 간격(%)</b> 기준으로 지정가 리밋 주문이 들어갑니다.
+        </p>
+
+        <div id="dca-list"></div>
+
+        <div class="row">
+          <button id="add-dca">+ 차수 추가</button>
+          <button id="pop-dca">- 마지막 삭제</button>
+        </div>
+
+        <div class="row">
+          <button id="save">💾 저장</button>
+        </div>
+
+        <small>가용 USDT: <span id="avail">{{ '%0.2f' % available_usdt }}</span></small>
+      </section>
+
+      <!-- 제어/상태 -->
+      <section class="card">
+        <h2>봇 제어</h2>
+        <div id="controls">
+          <!-- 처음엔 무조건 START 보이게 → 폴링 성공 후 토글 -->
+          <button id="start">🚀 시작</button>
+          <button id="stop" style="display:none">⏹️ 정지</button>
+          <button id="repeat">{{ '🔁 반복 중지' if repeat_mode else '🔁 반복 시작' }}</button>
+        </div>
+
+        <div class="status">
+          <div>실행: <span id="st-running">{{ 'ON' if running else 'OFF' }}</span></div>
+          <div>반복: <span id="st-repeat">{{ 'ON' if repeat_mode else 'OFF' }}</span></div>
+          <div>현재 심볼: <span id="st-symbol">-</span></div>
+          <div>평단: <span id="st-avg">0</span></div>
+          <div>수량: <span id="st-qty">0</span></div>
+          <div>마크가: <span id="st-mark">-</span></div>
+          <div>레버리지(거래소): <span id="st-lev-exch">-</span></div>
+          <div>레버리지(설정): <span id="st-lev-cfg">-</span></div>
+          <div>필요 증거금: <span id="st-budget-need">-</span></div>
+          <div>가용 증거금: <span id="st-budget-av">-</span></div>
+          <div>TP id: <span id="st-tp">-</span></div>
+          <div style="color:#f66" id="st-warn"></div>
+        </div>
+      </section>
+    </div>
+  </div>
+
+  <script type="module">
+    const maxDca = 20;
+
+    // 입력 엘리먼트
+    const dcaList = document.getElementById('dca-list');
+    const elSymbol = document.getElementById('symbol');
+    const elSide   = document.getElementById('side');
+    const elMode   = document.getElementById('margin_mode');
+    const elLev    = document.getElementById('leverage');
+    const elTp     = document.getElementById('tp_percent');
+
+    // 상태 엘리먼트
+    const stRun   = document.getElementById('st-running');
+    const stRepeat= document.getElementById('st-repeat');
+    const stSym   = document.getElementById('st-symbol');
+    const stAvg   = document.getElementById('st-avg');
+    const stQty   = document.getElementById('st-qty');
+    const stMark  = document.getElementById('st-mark');
+    const stLevX  = document.getElementById('st-lev-exch');
+    const stLevCfg= document.getElementById('st-lev-cfg');
+    const stNeed  = document.getElementById('st-budget-need');
+    const stAv    = document.getElementById('st-budget-av');
+    const stTp    = document.getElementById('st-tp');
+    const stWarn  = document.getElementById('st-warn');
+
+    // 제어 버튼
+    const btnStart = document.getElementById('start');
+    const btnStop  = document.getElementById('stop');
+    const btnRepeat= document.getElementById('repeat');
+
+    // 서버 cfg 주입
+    let cfg = {{ cfg|tojson }};
+
+    // DCA 상태(단일 소스)
+    let dcaState = Array.isArray(cfg.dca_config) && cfg.dca_config.length
+      ? JSON.parse(JSON.stringify(cfg.dca_config))
+      : [[0,0]];
+
+    // 버튼 표시 토글
+    function syncControls(running) {
+      if (!btnStart || !btnStop) return;
+      btnStart.style.display = running ? 'none' : '';
+      btnStop .style.display = running ? '' : 'none';
+      if (stRun) stRun.textContent = running ? 'ON' : 'OFF';
+    }
+
+    // DCA 렌더/변경
+    function rowTemplate(i, gap=0, usdt=0) {
+      return `
+        <div class="dca-row" data-index="${i}">
+          <span class="idx">${i+1}차</span>
+          <label>간격(%) <input type="number" step="0.1" name="gap" value="${gap}"></label>
+          <label>USDT <input type="number" step="0.01" name="usdt" value="${usdt}"></label>
+        </div>`;
+    }
+    function renderDcaList() {
+      dcaList.innerHTML = '';
+      dcaState.slice(0, maxDca).forEach(([gap, usdt], i) => {
+        dcaList.insertAdjacentHTML('beforeend', rowTemplate(i, gap, usdt));
+      });
+    }
+    dcaList.addEventListener('input', (e) => {
+      const t = e.target;
+      if (!t.matches('input[name="gap"], input[name="usdt"]')) return;
+      const row = t.closest('.dca-row');
+      const i = Number(row?.dataset.index ?? -1);
+      if (i < 0) return;
+      const gap = parseFloat(row.querySelector('input[name="gap"]').value || '0');
+      const usdt = parseFloat(row.querySelector('input[name="usdt"]').value || '0');
+      dcaState[i] = [gap, usdt];
+    });
+    document.getElementById('add-dca').addEventListener('click', () => {
+      if (dcaState.length >= maxDca) return;
+      dcaState.push([0,0]);
+      renderDcaList();
+    });
+    document.getElementById('pop-dca').addEventListener('click', () => {
+      if (dcaState.length <= 1) return;
+      dcaState.pop();
+      renderDcaList();
+    });
+
+    // 심볼 목록
+    async function loadSymbols() {
+      const res = await fetch('/symbols?ts=' + Date.now(), { cache: 'no-store' });
+      const list = await res.json();
+      elSymbol.innerHTML = '';
+      (Array.isArray(list) ? list : []).forEach(s => {
+        const opt = document.createElement('option');
+        opt.value = s; opt.textContent = s;
+        if (s === cfg.symbol) opt.selected = true;
+        elSymbol.appendChild(opt);
+      });
+    }
+
+    // 저장
+    async function saveConfig() {
+      const payload = {
+        symbol: elSymbol.value,
+        side: elSide.value,
+        margin_mode: elMode.value,
+        leverage: parseInt(elLev.value, 10),
+        tp_percent: parseFloat(elTp.value),
+        dca_config: dcaState
+      };
+      const r = await fetch('/config?ts=' + Date.now(), {
+        method: 'POST',
+        headers: { 'Content-Type':'application/json' },
+        body: JSON.stringify(payload)
+      });
+      const data = await r.json();
+      if (!r.ok) {
+        alert('설정 저장 실패: HTTP ' + r.status);
+        return;
+      }
+      if (data.error) {
+        alert('경고: ' + data.error);
+      }
+      if (data.cfg) {
+        cfg = data.cfg;
+        dcaState = JSON.parse(JSON.stringify(cfg.dca_config || [[0,0]]));
+        renderDcaList();
+        elSide.value = cfg.side;
+        elMode.value = cfg.margin_mode;
+        elLev.value  = cfg.leverage;
+        elTp.value   = cfg.tp_percent;
+        [...elSymbol.options].forEach(o => o.selected = (o.value === cfg.symbol));
+      }
+      alert('설정 저장 완료');
+    }
+    document.getElementById('save').addEventListener('click', saveConfig);
+
+    // 시작/정지/반복
+    if (btnStart) btnStart.addEventListener('click', async () => {
+      btnStart.disabled = true;
+      try {
+        const r = await fetch('/start?ts=' + Date.now(), { method: 'POST' });
+        const j = await r.json();
+        if (!r.ok || j.ok === false) throw new Error(j.msg || 'start failed');
+      } catch (e) {
+        alert('시작 실패: ' + e.message);
+      } finally {
+        btnStart.disabled = false;
+        pollStatus();
+      }
+    });
+    if (btnStop) btnStop.addEventListener('click', async () => {
+      btnStop.disabled = true;
+      try {
+        const r = await fetch('/stop?ts=' + Date.now(), { method: 'POST' });
+        const j = await r.json();
+        if (!r.ok || j.ok === false) throw new Error(j.msg || 'stop failed');
+      } catch (e) {
+        alert('정지 실패: ' + e.message);
+      } finally {
+        btnStop.disabled = false;
+        pollStatus();
+      }
+    });
+    if (btnRepeat) btnRepeat.addEventListener('click', async () => {
+      btnRepeat.disabled = true;
+      try {
+        const r = await fetch('/repeat?ts=' + Date.now(), { method: 'POST' });
+        const j = await r.json();
+        if (!r.ok || j.ok === false) throw new Error(j.error || 'repeat toggle failed');
+        stRepeat.textContent = j.repeat ? 'ON' : 'OFF';
+        btnRepeat.textContent = j.repeat ? '🔁 반복 중지' : '🔁 반복 시작';
+      } catch (e) {
+        alert('반복 토글 실패: ' + e.message);
+      } finally {
+        btnRepeat.disabled = false;
+      }
+    });
+
+    // 상태 폴링
+    async function pollStatus() {
+      try {
+        const res = await fetch('/status?ts=' + Date.now(), { cache: 'no-store' });
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        const s = await res.json();
+
+        const pp = Number.isInteger(s.price_precision) ? s.price_precision : 4;
+        const num = (v, p = pp) => (v === null || v === undefined || isNaN(+v) ? '-' : (+v).toFixed(p));
+
+        stSym.textContent = s.symbol || '-';
+        stAvg.textContent = num(s.position_avg_price);
+        stQty.textContent = num(s.position_qty, 0);
+        stMark.textContent = num(s.mark_price);
+        stLevX.textContent = s.exchange_leverage ?? '-';
+        stLevCfg.textContent = s.cfg_leverage ?? '-';
+        stNeed.textContent = s.budget_required != null ? num(s.budget_required, 4) : '-';
+        stAv.textContent   = s.budget_available != null ? num(s.budget_available, 4) : '-';
+        stTp.textContent   = s.tp_order_id || '-';
+
+        // 버튼 표시 동기화
+        syncControls(!!s.running);
+
+        // 반복 상태
+        const rep = !!s.repeat_mode;
+        stRepeat.textContent = rep ? 'ON' : 'OFF';
+        btnRepeat.textContent = rep ? '🔁 반복 중지' : '🔁 반복 시작';
+
+        // 레버리지 불일치 경고
+        if (s.exchange_leverage && s.cfg_leverage &&
+            Math.abs((+s.exchange_leverage) - (+s.cfg_leverage)) > 0.01) {
+          stWarn.textContent = `레버리지 불일치: 거래소 ${s.exchange_leverage}x ≠ 설정 ${s.cfg_leverage}x`;
+        } else {
+          stWarn.textContent = '';
+        }
+      } catch (e) {
+        // 폴링 실패 시에도 기본 버튼(START) 보이게 유지
+        syncControls(false);
+      }
+    }
+
+    // 초기화
+    await loadSymbols();
+    elSide.value = cfg.side || 'BUY';
+    elMode.value = cfg.margin_mode || 'CROSS';
+    elLev.value  = cfg.leverage ?? 10;
+    elTp.value   = cfg.tp_percent ?? 4.5;
+    renderDcaList();
+
+    // 첫 폴링 및 주기 폴링
+    await pollStatus();
+    let t = setInterval(pollStatus, 1500);
+    document.addEventListener('visibilitychange', () => {
+      if (document.hidden) { clearInterval(t); }
+      else { pollStatus(); t = setInterval(pollStatus, 1500); }
+    });
+  </script>
+</body>
+</html>
