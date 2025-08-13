@@ -4,39 +4,8 @@ import time
 import hmac
 import hashlib
 import requests
-import socket
 from urllib.parse import urlencode
 from utils.logging import log
-from requests.adapters import HTTPAdapter
-
-try:
-    # urllib3 v1/v2 호환
-    from urllib3.util.retry import Retry
-except Exception:
-    Retry = None
-
-# .env로 조절 가능 (없으면 기본값 사용)
-CONNECT_TIMEOUT = float(os.getenv("BX_CONNECT_TIMEOUT", "3"))
-READ_TIMEOUT    = float(os.getenv("BX_READ_TIMEOUT", "60"))  # ← 10 → 20초로 늘림
-MAX_RETRIES     = int(os.getenv("BX_MAX_RETRIES", "3"))
-BACKOFF         = float(os.getenv("BX_BACKOFF", "0.6"))
-
-# requests 세션 + 재시도 어댑터
-SESSION = requests.Session()
-if Retry is not None:
-    retry = Retry(
-        total=MAX_RETRIES,
-        connect=MAX_RETRIES,
-        read=MAX_RETRIES,
-        backoff_factor=BACKOFF,
-        status_forcelist=(429, 500, 502, 503, 504),
-        allowed_methods=frozenset(["GET","POST"])  # POST도 재시도
-    )
-    adapter = HTTPAdapter(pool_connections=10, pool_maxsize=10, max_retries=retry)
-else:
-    adapter = HTTPAdapter(pool_connections=10, pool_maxsize=10)
-SESSION.mount("https://", adapter)
-SESSION.mount("http://", adapter)
 
 import os
 SKIP_SETUP = os.getenv("SKIP_SETUP", "false").lower() == "true"
@@ -72,22 +41,16 @@ def _sign(params: dict) -> str:
 
 def _req_get(url: str, params: dict | None = None, signed: bool = False) -> dict:
     params = params or {}
+    if signed:
+        qs = _sign(params)
+        r = requests.get(url + "?" + qs, headers=_headers(), timeout=10)
+    else:
+        r = requests.get(url, params=params, headers=_headers(), timeout=10)
     try:
-        if signed:
-            qs = _sign(params)
-            r = SESSION.get(url + "?" + qs, headers=_headers(),
-                            timeout=(CONNECT_TIMEOUT, READ_TIMEOUT))
-        else:
-            r = SESSION.get(url, params=params, headers=_headers(),
-                            timeout=(CONNECT_TIMEOUT, READ_TIMEOUT))
         j = r.json()
-    except requests.exceptions.Timeout as e:
-        raise RuntimeError(f"HTTP GET timeout ({READ_TIMEOUT}s): {url}") from e
     except Exception:
-        # JSON 못 읽으면 HTTP 에러를 먼저 표준화
         r.raise_for_status()
         raise
-
     code = str(j.get("code", "0"))
     if code != "0":
         msg = j.get("msg") or j
@@ -110,26 +73,15 @@ def _req_delete(url: str, params: dict | None = None, signed: bool = False) -> d
 
 def _req_post(url: str, body: dict | None = None, signed: bool = False) -> dict:
     body = body or {}
-    try:
-        if signed:
-            payload = _sign(body)                # "a=1&b=2&signature=..."
-            r = SESSION.post(url, data=payload,  # 서명 요청은 form-encoded
-                             headers=_headers(),
-                             timeout=(CONNECT_TIMEOUT, READ_TIMEOUT))
-        else:
-            r = SESSION.post(url, json=body, headers=_headers(),
-                             timeout=(CONNECT_TIMEOUT, READ_TIMEOUT))
-        j = r.json()
-    except requests.exceptions.Timeout as e:
-        raise RuntimeError(f"HTTP POST timeout ({READ_TIMEOUT}s): {url}") from e
-    except Exception:
-        r.raise_for_status()
-        raise
-
+    if signed:
+        payload = _sign(body)  # querystring + signature
+        r = requests.post(url, data=payload, headers=_headers(form=True), timeout=10)
+    else:
+        r = requests.post(url, json=body, headers=_headers(form=False), timeout=10)
+    j = r.json()
     code = str(j.get("code", "0"))
     if code != "0":
-        msg = j.get("msg") or j
-        raise RuntimeError(f"BingX error @POST {url}: {code} {msg}")
+        raise RuntimeError(f"BingX error @POST {url}: {code} {j.get('msg')}")
     return j
 
 
@@ -515,132 +467,164 @@ class BingXClient:
     # ----- Orders / Positions -----
     def place_market(self, symbol: str, side: str, qty: float,
                     reduce_only: bool=False, position_side: str|None=None) -> str:
+        import math
         url = f"{BASE}/openApi/swap/v2/trade/order"
 
-        # --- precision & minQty 보정 ---
+        # === 정밀도/최소수량/스텝 보정 ===
         pp, qp = self.get_symbol_filters(symbol)
         min_qty = 0.0
-        step = 0.0
+        step = 1.0 if qp == 0 else 10 ** (-qp)
         try:
             spec = self.get_contract_spec(symbol)
-            min_qty = float(spec.get("tradeMinQuantity", 0) or spec.get("minQty", 0) or 0.0)
-            step    = float(spec.get("qtyStep", 0.0) or 0.0)
+            # 다양한 키 대응
+            min_qty = float(
+                spec.get("tradeMinQuantity")
+                or spec.get("minQty")
+                or spec.get("minVol")
+                or spec.get("minTradeNum")
+                or 0.0
+            )
+            step = float(
+                spec.get("qtyStep")
+                or spec.get("volumeStep")
+                or spec.get("stepSize")
+                or step
+            )
         except Exception:
             pass
-        if step <= 0:
-            step = 1.0 if (qp == 0) else 10 ** (-qp)
 
-        # 수량 보정
-        qty = max(qty, min_qty if min_qty > 0 else 0.0)
-        # 스텝 내림 보정
-        if step > 0:
-            qty = (int(qty/step) * step)
-        # 정밀도 보정
-        if qp <= 0:
-            qty = int(round(qty))
-        else:
-            qty = float(f"{qty:.{qp}f}")
-
+        qty = max(qty, 0.0)
+        # 스텝 내림
+        qty = math.floor(qty / step) * step
+        # 자리수 보정
+        qty = float(f"{qty:.{max(qp,0)}f}")
+        # 최소수량 보정
+        if qty < (min_qty or step):
+            qty = (min_qty or step)
         if qty <= 0:
-            raise RuntimeError(f"market qty <= 0 (adj with qp={qp}, step={step}, min={min_qty})")
+            raise RuntimeError(f"quantity <= 0 after precision adjust (qp={qp}, min={min_qty}, step={step})")
 
+        # === 페이로드 ===
         base = {
-            "symbol": symbol,
+            "symbol": symbol,          # "DOGE-USDT"
+            "type": "MARKET",
+            "side": side.upper(),      # BUY / SELL
+            "quantity": qty,
             "recvWindow": 60000,
             "timestamp": _ts(),
-            "side": side.upper(),     # BUY / SELL
-            # MARKET은 price/tiF 없음
         }
-        # HEDGE면 positionSide만, reduceOnly는 금지
+        # HEDGE면 reduceOnly 금지, positionSide만
         if POSITION_MODE == "HEDGE":
             base["positionSide"] = position_side or ("LONG" if side.upper()=="BUY" else "SHORT")
         else:
             if reduce_only:
                 base["reduceOnly"] = True
 
-        # --- 여러 변형 시도 ---
-        variants = []
-        # 공식 키 우선
-        variants.append(base | {"type": "MARKET", "quantity": qty})
-        # 대체 키들
-        variants.append(base | {"type": "MARKET", "qty": qty})
-        variants.append(base | {"orderType": "MARKET", "quantity": qty})
-        variants.append(base | {"orderType": "MARKET", "qty": qty})
-        # 일부 환경: clientOrderId/ID 요구
-        cid = f"cli-{int(time.time()*1000)}"
-        variants.append(base | {"type": "MARKET", "quantity": qty, "clientOrderId": cid})
-        variants.append(base | {"type": "MARKET", "quantity": qty, "clientOrderID": cid})
+        # === 요청/응답 파싱 ===
+        j = _req_post(url, base, signed=True)
 
-        return self._try_order(url, variants)
+        # orderId 추출 (data.order.orderId 형태 대응)
+        oid = None
+        if isinstance(j, dict):
+            oid = j.get("orderId") or j.get("id")
+            if not oid:
+                d = j.get("data") or {}
+                if isinstance(d, dict):
+                    oid = d.get("orderId") or d.get("orderID") or d.get("id")
+                    if not oid:
+                        o = d.get("order") or {}
+                        if isinstance(o, dict):
+                            oid = o.get("orderId") or o.get("orderID") or o.get("id") or o.get("order_id")
+        if not oid:
+            raise RuntimeError(f"market order no orderId: {j}")
+
+        # (선택) 체결 로그
+        try:
+            o = j.get("data", {}).get("order", {})
+            log(f"✅ market filled: id={oid} avg={o.get('avgPrice')} qty={o.get('executedQty')}")
+        except Exception:
+            pass
+
+        return str(oid)
 
 
 
     def place_limit(self, symbol: str, side: str, qty: float, price: float,
                     reduce_only: bool=False, position_side: str|None=None,
                     tif: str="GTC") -> str:
+        import math
         url = f"{BASE}/openApi/swap/v2/trade/order"
 
-        # --- precision & minQty 보정 ---
+        # === 정밀도/최소수량/스텝 보정 ===
         pp, qp = self.get_symbol_filters(symbol)
         min_qty = 0.0
-        step = 0.0
+        step = 1.0 if qp == 0 else 10 ** (-qp)
         try:
             spec = self.get_contract_spec(symbol)
-            min_qty = float(spec.get("tradeMinQuantity", 0) or spec.get("minQty", 0) or 0.0)
-            step    = float(spec.get("qtyStep", 0.0) or 0.0)
+            min_qty = float(
+                spec.get("tradeMinQuantity")
+                or spec.get("minQty")
+                or spec.get("minVol")
+                or spec.get("minTradeNum")
+                or 0.0
+            )
+            step = float(
+                spec.get("qtyStep")
+                or spec.get("volumeStep")
+                or spec.get("stepSize")
+                or step
+            )
         except Exception:
             pass
-        if step <= 0:
-            step = 1.0 if (qp == 0) else 10 ** (-qp)
 
-        # 수량/가격 보정
-        qty = max(qty, min_qty if min_qty > 0 else 0.0)
-        if step > 0:
-            qty = (int(qty/step) * step)
-        if qp <= 0:
-            qty = int(round(qty))
-        else:
-            qty = float(f"{qty:.{qp}f}")
-
-        if pp <= 0:
-            price = int(round(price))
-        else:
-            price = float(f"{price:.{pp}f}")
-
+        qty = max(qty, 0.0)
+        qty = math.floor(qty / step) * step
+        qty = float(f"{qty:.{max(qp,0)}f}")
+        if qty < (min_qty or step):
+            qty = (min_qty or step)
         if qty <= 0:
-            raise RuntimeError(f"limit qty <= 0 (adj with qp={qp}, step={step}, min={min_qty})")
-        if price <= 0:
-            raise RuntimeError(f"limit price <= 0")
+            raise RuntimeError(f"quantity <= 0 (tp/limit) after adjust (qp={qp}, min={min_qty}, step={step})")
 
+        price = float(f"{float(price):.{max(pp,0)}f}")
+        if price <= 0:
+            raise RuntimeError("price <= 0 (tp/limit)")
+
+        # === 페이로드 ===
         base = {
             "symbol": symbol,
+            "type": "LIMIT",
+            "side": side.upper(),
+            "quantity": qty,
+            "price": price,
+            "timeInForce": tif,   # GTC
             "recvWindow": 60000,
             "timestamp": _ts(),
-            "side": side.upper(),
-            # LIMIT 은 price + timeInForce 필수가 대부분
-            "timeInForce": tif,
         }
-        # HEDGE면 positionSide만, reduceOnly는 금지
+        # HEDGE면 reduceOnly 금지, positionSide만
         if POSITION_MODE == "HEDGE":
             base["positionSide"] = position_side or ("LONG" if side.upper()=="BUY" else "SHORT")
         else:
             if reduce_only:
                 base["reduceOnly"] = True
 
-        # --- 여러 변형 시도 ---
-        variants = []
-        # 공식 키 우선
-        variants.append(base | {"type": "LIMIT", "quantity": qty, "price": price})
-        # 대체 키들
-        variants.append(base | {"type": "LIMIT", "qty": qty, "price": price})
-        variants.append(base | {"orderType": "LIMIT", "quantity": qty, "price": price})
-        variants.append(base | {"orderType": "LIMIT", "qty": qty, "price": price})
-        # clientOrderId/ID
-        cid = f"cli-{int(time.time()*1000)}"
-        variants.append(base | {"type": "LIMIT", "quantity": qty, "price": price, "clientOrderId": cid})
-        variants.append(base | {"type": "LIMIT", "quantity": qty, "price": price, "clientOrderID": cid})
+        # === 요청/응답 파싱 ===
+        j = _req_post(url, base, signed=True)
 
-        return self._try_order(url, variants)
+        oid = None
+        if isinstance(j, dict):
+            oid = j.get("orderId") or j.get("id")
+            if not oid:
+                d = j.get("data") or {}
+                if isinstance(d, dict):
+                    oid = d.get("orderId") or d.get("orderID") or d.get("id")
+                    if not oid:
+                        o = d.get("order") or {}
+                        if isinstance(o, dict):
+                            oid = o.get("orderId") or o.get("orderID") or o.get("id") or o.get("order_id")
+        if not oid:
+            raise RuntimeError(f"limit order no orderId: {j}")
+
+        return str(oid)
 
 
 
