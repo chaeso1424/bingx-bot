@@ -515,164 +515,132 @@ class BingXClient:
     # ----- Orders / Positions -----
     def place_market(self, symbol: str, side: str, qty: float,
                     reduce_only: bool=False, position_side: str|None=None) -> str:
-        import math
         url = f"{BASE}/openApi/swap/v2/trade/order"
 
-        # === 정밀도/최소수량/스텝 보정 ===
+        # --- precision & minQty 보정 ---
         pp, qp = self.get_symbol_filters(symbol)
         min_qty = 0.0
-        step = 1.0 if qp == 0 else 10 ** (-qp)
+        step = 0.0
         try:
             spec = self.get_contract_spec(symbol)
-            # 다양한 키 대응
-            min_qty = float(
-                spec.get("tradeMinQuantity")
-                or spec.get("minQty")
-                or spec.get("minVol")
-                or spec.get("minTradeNum")
-                or 0.0
-            )
-            step = float(
-                spec.get("qtyStep")
-                or spec.get("volumeStep")
-                or spec.get("stepSize")
-                or step
-            )
+            min_qty = float(spec.get("tradeMinQuantity", 0) or spec.get("minQty", 0) or 0.0)
+            step    = float(spec.get("qtyStep", 0.0) or 0.0)
         except Exception:
             pass
+        if step <= 0:
+            step = 1.0 if (qp == 0) else 10 ** (-qp)
 
-        qty = max(qty, 0.0)
-        # 스텝 내림
-        qty = math.floor(qty / step) * step
-        # 자리수 보정
-        qty = float(f"{qty:.{max(qp,0)}f}")
-        # 최소수량 보정
-        if qty < (min_qty or step):
-            qty = (min_qty or step)
+        # 수량 보정
+        qty = max(qty, min_qty if min_qty > 0 else 0.0)
+        # 스텝 내림 보정
+        if step > 0:
+            qty = (int(qty/step) * step)
+        # 정밀도 보정
+        if qp <= 0:
+            qty = int(round(qty))
+        else:
+            qty = float(f"{qty:.{qp}f}")
+
         if qty <= 0:
-            raise RuntimeError(f"quantity <= 0 after precision adjust (qp={qp}, min={min_qty}, step={step})")
+            raise RuntimeError(f"market qty <= 0 (adj with qp={qp}, step={step}, min={min_qty})")
 
-        # === 페이로드 ===
         base = {
-            "symbol": symbol,          # "DOGE-USDT"
-            "type": "MARKET",
-            "side": side.upper(),      # BUY / SELL
-            "quantity": qty,
+            "symbol": symbol,
             "recvWindow": 60000,
             "timestamp": _ts(),
+            "side": side.upper(),     # BUY / SELL
+            # MARKET은 price/tiF 없음
         }
-        # HEDGE면 reduceOnly 금지, positionSide만
+        # HEDGE면 positionSide만, reduceOnly는 금지
         if POSITION_MODE == "HEDGE":
             base["positionSide"] = position_side or ("LONG" if side.upper()=="BUY" else "SHORT")
         else:
             if reduce_only:
                 base["reduceOnly"] = True
 
-        # === 요청/응답 파싱 ===
-        j = _req_post(url, base, signed=True)
+        # --- 여러 변형 시도 ---
+        variants = []
+        # 공식 키 우선
+        variants.append(base | {"type": "MARKET", "quantity": qty})
+        # 대체 키들
+        variants.append(base | {"type": "MARKET", "qty": qty})
+        variants.append(base | {"orderType": "MARKET", "quantity": qty})
+        variants.append(base | {"orderType": "MARKET", "qty": qty})
+        # 일부 환경: clientOrderId/ID 요구
+        cid = f"cli-{int(time.time()*1000)}"
+        variants.append(base | {"type": "MARKET", "quantity": qty, "clientOrderId": cid})
+        variants.append(base | {"type": "MARKET", "quantity": qty, "clientOrderID": cid})
 
-        # orderId 추출 (data.order.orderId 형태 대응)
-        oid = None
-        if isinstance(j, dict):
-            oid = j.get("orderId") or j.get("id")
-            if not oid:
-                d = j.get("data") or {}
-                if isinstance(d, dict):
-                    oid = d.get("orderId") or d.get("orderID") or d.get("id")
-                    if not oid:
-                        o = d.get("order") or {}
-                        if isinstance(o, dict):
-                            oid = o.get("orderId") or o.get("orderID") or o.get("id") or o.get("order_id")
-        if not oid:
-            raise RuntimeError(f"market order no orderId: {j}")
-
-        # (선택) 체결 로그
-        try:
-            o = j.get("data", {}).get("order", {})
-            log(f"✅ market filled: id={oid} avg={o.get('avgPrice')} qty={o.get('executedQty')}")
-        except Exception:
-            pass
-
-        return str(oid)
+        return self._try_order(url, variants)
 
 
 
     def place_limit(self, symbol: str, side: str, qty: float, price: float,
                     reduce_only: bool=False, position_side: str|None=None,
                     tif: str="GTC") -> str:
-        import math
         url = f"{BASE}/openApi/swap/v2/trade/order"
 
-        # === 정밀도/최소수량/스텝 보정 ===
+        # --- precision & minQty 보정 ---
         pp, qp = self.get_symbol_filters(symbol)
         min_qty = 0.0
-        step = 1.0 if qp == 0 else 10 ** (-qp)
+        step = 0.0
         try:
             spec = self.get_contract_spec(symbol)
-            min_qty = float(
-                spec.get("tradeMinQuantity")
-                or spec.get("minQty")
-                or spec.get("minVol")
-                or spec.get("minTradeNum")
-                or 0.0
-            )
-            step = float(
-                spec.get("qtyStep")
-                or spec.get("volumeStep")
-                or spec.get("stepSize")
-                or step
-            )
+            min_qty = float(spec.get("tradeMinQuantity", 0) or spec.get("minQty", 0) or 0.0)
+            step    = float(spec.get("qtyStep", 0.0) or 0.0)
         except Exception:
             pass
+        if step <= 0:
+            step = 1.0 if (qp == 0) else 10 ** (-qp)
 
-        qty = max(qty, 0.0)
-        qty = math.floor(qty / step) * step
-        qty = float(f"{qty:.{max(qp,0)}f}")
-        if qty < (min_qty or step):
-            qty = (min_qty or step)
+        # 수량/가격 보정
+        qty = max(qty, min_qty if min_qty > 0 else 0.0)
+        if step > 0:
+            qty = (int(qty/step) * step)
+        if qp <= 0:
+            qty = int(round(qty))
+        else:
+            qty = float(f"{qty:.{qp}f}")
+
+        if pp <= 0:
+            price = int(round(price))
+        else:
+            price = float(f"{price:.{pp}f}")
+
         if qty <= 0:
-            raise RuntimeError(f"quantity <= 0 (tp/limit) after adjust (qp={qp}, min={min_qty}, step={step})")
-
-        price = float(f"{float(price):.{max(pp,0)}f}")
+            raise RuntimeError(f"limit qty <= 0 (adj with qp={qp}, step={step}, min={min_qty})")
         if price <= 0:
-            raise RuntimeError("price <= 0 (tp/limit)")
+            raise RuntimeError(f"limit price <= 0")
 
-        # === 페이로드 ===
         base = {
             "symbol": symbol,
-            "type": "LIMIT",
-            "side": side.upper(),
-            "quantity": qty,
-            "price": price,
-            "timeInForce": tif,   # GTC
             "recvWindow": 60000,
             "timestamp": _ts(),
+            "side": side.upper(),
+            # LIMIT 은 price + timeInForce 필수가 대부분
+            "timeInForce": tif,
         }
-        # HEDGE면 reduceOnly 금지, positionSide만
+        # HEDGE면 positionSide만, reduceOnly는 금지
         if POSITION_MODE == "HEDGE":
             base["positionSide"] = position_side or ("LONG" if side.upper()=="BUY" else "SHORT")
         else:
             if reduce_only:
                 base["reduceOnly"] = True
 
-        # === 요청/응답 파싱 ===
-        j = _req_post(url, base, signed=True)
+        # --- 여러 변형 시도 ---
+        variants = []
+        # 공식 키 우선
+        variants.append(base | {"type": "LIMIT", "quantity": qty, "price": price})
+        # 대체 키들
+        variants.append(base | {"type": "LIMIT", "qty": qty, "price": price})
+        variants.append(base | {"orderType": "LIMIT", "quantity": qty, "price": price})
+        variants.append(base | {"orderType": "LIMIT", "qty": qty, "price": price})
+        # clientOrderId/ID
+        cid = f"cli-{int(time.time()*1000)}"
+        variants.append(base | {"type": "LIMIT", "quantity": qty, "price": price, "clientOrderId": cid})
+        variants.append(base | {"type": "LIMIT", "quantity": qty, "price": price, "clientOrderID": cid})
 
-        oid = None
-        if isinstance(j, dict):
-            oid = j.get("orderId") or j.get("id")
-            if not oid:
-                d = j.get("data") or {}
-                if isinstance(d, dict):
-                    oid = d.get("orderId") or d.get("orderID") or d.get("id")
-                    if not oid:
-                        o = d.get("order") or {}
-                        if isinstance(o, dict):
-                            oid = o.get("orderId") or o.get("orderID") or o.get("id") or o.get("order_id")
-        if not oid:
-            raise RuntimeError(f"limit order no orderId: {j}")
-
-        return str(oid)
+        return self._try_order(url, variants)
 
 
 
