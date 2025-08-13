@@ -4,8 +4,39 @@ import time
 import hmac
 import hashlib
 import requests
+import socket
 from urllib.parse import urlencode
 from utils.logging import log
+from requests.adapters import HTTPAdapter
+
+try:
+    # urllib3 v1/v2 호환
+    from urllib3.util.retry import Retry
+except Exception:
+    Retry = None
+
+# .env로 조절 가능 (없으면 기본값 사용)
+CONNECT_TIMEOUT = float(os.getenv("BX_CONNECT_TIMEOUT", "3"))
+READ_TIMEOUT    = float(os.getenv("BX_READ_TIMEOUT", "60"))  # ← 10 → 20초로 늘림
+MAX_RETRIES     = int(os.getenv("BX_MAX_RETRIES", "3"))
+BACKOFF         = float(os.getenv("BX_BACKOFF", "0.6"))
+
+# requests 세션 + 재시도 어댑터
+SESSION = requests.Session()
+if Retry is not None:
+    retry = Retry(
+        total=MAX_RETRIES,
+        connect=MAX_RETRIES,
+        read=MAX_RETRIES,
+        backoff_factor=BACKOFF,
+        status_forcelist=(429, 500, 502, 503, 504),
+        allowed_methods=frozenset(["GET","POST"])  # POST도 재시도
+    )
+    adapter = HTTPAdapter(pool_connections=10, pool_maxsize=10, max_retries=retry)
+else:
+    adapter = HTTPAdapter(pool_connections=10, pool_maxsize=10)
+SESSION.mount("https://", adapter)
+SESSION.mount("http://", adapter)
 
 import os
 SKIP_SETUP = os.getenv("SKIP_SETUP", "false").lower() == "true"
@@ -41,16 +72,22 @@ def _sign(params: dict) -> str:
 
 def _req_get(url: str, params: dict | None = None, signed: bool = False) -> dict:
     params = params or {}
-    if signed:
-        qs = _sign(params)
-        r = requests.get(url + "?" + qs, headers=_headers(), timeout=10)
-    else:
-        r = requests.get(url, params=params, headers=_headers(), timeout=10)
     try:
+        if signed:
+            qs = _sign(params)
+            r = SESSION.get(url + "?" + qs, headers=_headers(),
+                            timeout=(CONNECT_TIMEOUT, READ_TIMEOUT))
+        else:
+            r = SESSION.get(url, params=params, headers=_headers(),
+                            timeout=(CONNECT_TIMEOUT, READ_TIMEOUT))
         j = r.json()
+    except requests.exceptions.Timeout as e:
+        raise RuntimeError(f"HTTP GET timeout ({READ_TIMEOUT}s): {url}") from e
     except Exception:
+        # JSON 못 읽으면 HTTP 에러를 먼저 표준화
         r.raise_for_status()
         raise
+
     code = str(j.get("code", "0"))
     if code != "0":
         msg = j.get("msg") or j
@@ -73,15 +110,26 @@ def _req_delete(url: str, params: dict | None = None, signed: bool = False) -> d
 
 def _req_post(url: str, body: dict | None = None, signed: bool = False) -> dict:
     body = body or {}
-    if signed:
-        payload = _sign(body)  # querystring + signature
-        r = requests.post(url, data=payload, headers=_headers(form=True), timeout=10)
-    else:
-        r = requests.post(url, json=body, headers=_headers(form=False), timeout=10)
-    j = r.json()
+    try:
+        if signed:
+            payload = _sign(body)                # "a=1&b=2&signature=..."
+            r = SESSION.post(url, data=payload,  # 서명 요청은 form-encoded
+                             headers=_headers(),
+                             timeout=(CONNECT_TIMEOUT, READ_TIMEOUT))
+        else:
+            r = SESSION.post(url, json=body, headers=_headers(),
+                             timeout=(CONNECT_TIMEOUT, READ_TIMEOUT))
+        j = r.json()
+    except requests.exceptions.Timeout as e:
+        raise RuntimeError(f"HTTP POST timeout ({READ_TIMEOUT}s): {url}") from e
+    except Exception:
+        r.raise_for_status()
+        raise
+
     code = str(j.get("code", "0"))
     if code != "0":
-        raise RuntimeError(f"BingX error @POST {url}: {code} {j.get('msg')}")
+        msg = j.get("msg") or j
+        raise RuntimeError(f"BingX error @POST {url}: {code} {msg}")
     return j
 
 
