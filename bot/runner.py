@@ -71,20 +71,16 @@ class BotRunner:
             target_notional = float(usdt_amt) * lev
             raw_qty = target_notional / max(price * contract, 1e-12)
             q = floor_to_step(raw_qty, step)
-            # 거래소 최소 충족(축소가 아님, 필수 보정)
             if q < (min_qty or step):
                 q = max(min_qty, step)
             need_margin = (q * price * contract) / lev
             return q, price, need_margin
 
         plan = []
-
-        # 1차(시장가)
         first_usdt = float(self.cfg.dca_config[0][1])
         q1, p1, m1 = _plan_unit(mark, first_usdt)
         plan.append({"type": "MARKET", "price": p1, "qty": q1, "usdt": m1})
 
-        # DCA 리밋들
         cum = 0.0
         for gap, usdt_amt in self.cfg.dca_config[1:]:
             cum += float(gap)
@@ -127,7 +123,6 @@ class BotRunner:
         if qty_now < min_allowed:
             return
 
-        # entry: 평균가(0이면 1회 한정 mark/last로 대체)
         entry = float(self.state.position_avg_price or 0.0)
         if entry <= 0:
             try:
@@ -135,18 +130,13 @@ class BotRunner:
             except Exception:
                 entry = float(self.client.get_last_price(self.cfg.symbol))
 
-        # 레버리지 기준 ROI → 목표 TP 가격(틱 방향 포함)
         tp_price = tp_price_from_roi(entry, side, float(self.cfg.tp_percent), int(self.cfg.leverage), pp)
-
-        # 수량 보정
         tp_qty = floor_to_step(qty_now, float(step or 1.0))
         if tp_qty < min_allowed:
             tp_qty = min_allowed
-
         if not (tp_price and tp_price > 0):
             return
 
-        # 기존 TP 살아있고 변화가 미미하면 유지(가격 2틱, 수량 1스텝 데드밴드)
         price_changed = True
         qty_changed   = True
         if self.state.tp_order_id:
@@ -167,22 +157,19 @@ class BotRunner:
                 if not (price_changed or qty_changed):
                     return
                 else:
-                    # 변경 필요 → 기존 TP 취소
                     try:
                         self.client.cancel_order(self.cfg.symbol, self.state.tp_order_id)
                     except Exception:
                         pass
                     self.state.tp_order_id = None
 
-        # 새 TP 배치
         tp_side = "SELL" if side.upper() == "BUY" else "BUY"
         tp_pos  = "LONG" if side.upper() == "BUY" else "SHORT"
         new_id = self.client.place_limit(
             self.cfg.symbol, tp_side, tp_qty, tp_price,
-            reduce_only=False, position_side=tp_pos
+            reduce_only=False, position_side=tp_pos, close_position=True   # ✅ 닫기전용
         )
         self.state.tp_order_id = str(new_id)
-        # 모니터링 기준값 저장
         self._last_tp_price = tp_price
         self._last_tp_qty   = tp_qty
         log(f"🎯 (attach) TP 확보: id={new_id}, price={tp_price}, qty={tp_qty}, side={tp_side}/{tp_pos}")
@@ -191,19 +178,6 @@ class BotRunner:
     def _run(self):
         try:
             while not self._stop:
-                # 0) 가용 USDT 체크
-                try:
-                    av = float(self.client.get_available_usdt())
-                except Exception as e:
-                    log(f"❌ 가용잔고 조회 실패: {e}")
-                    av = 0.0
-                budget = sum(float(usdt) for _, usdt in self.cfg.dca_config)
-                if av < 0.99:
-                    log("⛔ 가용 USDT 없음 → 종료")
-                    break
-                if av < budget:
-                    log(f"⚠️ 가용 {av} < 계획 {budget} USDT (일부만 체결될 수 있음)")
-
                 # 1) 정밀도/스펙 동기화
                 try:
                     pp, qp = self.client.get_symbol_filters(self.cfg.symbol)
@@ -227,25 +201,45 @@ class BotRunner:
                 side = self.cfg.side.upper()
                 mark = float(self.client.get_mark_price(self.cfg.symbol))
 
-                # 1.6) === 사전 예산 점검 ===
-                required, plan = self._estimate_required_margin(side, mark, spec, pp, step)
+                # ---- 현재 포지션 파악(attach 모드 여부 선결정) ----
+                try:
+                    pre_avg, pre_qty = self.client.position_info(self.cfg.symbol, self.cfg.side)
+                except Exception:
+                    pre_avg, pre_qty = 0.0, 0.0
+                min_live_qty = max(float(min_qty or 0.0), float(step or 0.0))
+                attach_mode = (float(pre_qty) >= (min_live_qty * ZERO_EPS_FACTOR))
+
+                # 0) 가용 USDT 체크 (attach 모드면 패스 가능)
                 try:
                     av = float(self.client.get_available_usdt())
-                except Exception:
-                    pass
-                self.state.budget_ok = av + 1e-9 >= required
-                self.state.budget_required = required
-                self.state.budget_available = av
-
-                if av + 1e-9 < required:
-                    gap = required - av
-                    log("⛔ 예산 부족: 모든 진입 주문에 필요한 증거금이 가용 USDT보다 큽니다.")
-                    log(f"   필요≈{required:.4f} USDT, 가용≈{av:.4f} USDT, 부족≈{gap:.4f} USDT")
-                    for idx, x in enumerate(plan, start=1):
-                        log(f"   · {idx:02d} {x['type']}: price={x['price']} qty={x['qty']} → 증거금≈{x['usdt']:.4f} USDT")
+                except Exception as e:
+                    log(f"❌ 가용잔고 조회 실패: {e}")
+                    av = 0.0
+                budget = sum(float(usdt) for _, usdt in self.cfg.dca_config)
+                if av < 0.99 and not attach_mode:
+                    log("⛔ 가용 USDT 없음 → 종료")
                     break
-                else:
-                    log(f"💰 예산 확인 OK: 필요≈{required:.4f} USDT ≤ 가용≈{av:.4f} USDT")
+
+                # 1.6) === 사전 예산 점검 (attach 모드는 스킵) ===
+                if not attach_mode:
+                    required, plan = self._estimate_required_margin(side, mark, spec, pp, step)
+                    try:
+                        av = float(self.client.get_available_usdt())
+                    except Exception:
+                        pass
+                    self.state.budget_ok = av + 1e-9 >= required
+                    self.state.budget_required = required
+                    self.state.budget_available = av
+
+                    if av + 1e-9 < required:
+                        gap = required - av
+                        log("⛔ 예산 부족: 모든 진입 주문에 필요한 증거금이 가용 USDT보다 큽니다.")
+                        log(f"   필요≈{required:.4f} USDT, 가용≈{av:.4f} USDT, 부족≈{gap:.4f} USDT")
+                        for idx, x in enumerate(plan, start=1):
+                            log(f"   · {idx:02d} {x['type']}: price={x['price']} qty={x['qty']} → 증거금≈{x['usdt']:.4f} USDT")
+                        break
+                    else:
+                        log(f"💰 예산 확인 OK: 필요≈{required:.4f} USDT ≤ 가용≈{av:.4f} USDT")
 
                 # === 레버리지 검증 (자동조정 없음)
                 lev_now = self.client.get_current_leverage(self.cfg.symbol, self.cfg.side)
@@ -259,23 +253,13 @@ class BotRunner:
                 else:
                     log("ℹ️ 현재 포지션이 없어 레버리지 조회값 없음 → 주문 후 다시 검증 예정")
 
-                # ---- 사이클 시작: 기존 포지션 연결 모드 감지 ----
-                try:
-                    pre_avg, pre_qty = self.client.position_info(self.cfg.symbol, self.cfg.side)
-                except Exception:
-                    pre_avg, pre_qty = 0.0, 0.0
-
-                min_live_qty = max(float(min_qty or 0.0), float(step or 0.0))
-                attach_mode = (float(pre_qty) >= (min_live_qty * ZERO_EPS_FACTOR))
-
-                # === attach 모드이면: 시장가+DCA 전부 스킵, TP만 확보 ===
+                # === attach 모드: 시장가/DCA 스킵, TP만 확보 ===
                 if attach_mode:
                     log(f"🔗 기존 포지션 연결 모드: qty={pre_qty}, avg={pre_avg} → DCA/시장가 스킵, TP 확보")
                     self.state.position_avg_price = pre_avg
                     self.state.position_qty = pre_qty
                     self._ensure_tp_for_current_position(int(pp), float(step), float(min_qty), side)
 
-                    # 모니터링용 기준값 초기화(있으면 재사용)
                     last_entry     = float(pre_avg or 0.0)
                     last_tp_price  = self._last_tp_price
                     last_tp_qty    = self._last_tp_qty
@@ -296,6 +280,7 @@ class BotRunner:
                     log(f"🚀 1차 시장가 진입 주문: {oid} (투입≈{first_usdt} USDT, qty={qty})")
 
                     # 3) 나머지 DCA 리밋 깔기
+                    entry_pos_side = "LONG" if side == "BUY" else "SHORT"
                     cumulative = 0.0
                     self.state.open_limit_ids.clear()
                     for i, (gap_pct, usdt_amt) in enumerate(self.cfg.dca_config[1:], start=2):
@@ -308,7 +293,7 @@ class BotRunner:
                         if q < (min_qty or step):
                             log(f"⚠️ {i}차 수량이 최소수량 미달(raw={raw_qty}) → {max(min_qty, step)}로 보정")
                             q = max(min_qty, step)
-                        lid = self.client.place_limit(self.cfg.symbol, side, q, price)
+                        lid = self.client.place_limit(self.cfg.symbol, side, q, price, position_side=entry_pos_side)
                         self.state.open_limit_ids.append(str(lid))
                         log(f"🧩 {i}차 리밋: id={lid}, price={price}, qty={q}, 투입≈{usdt_amt}USDT")
 
@@ -332,7 +317,6 @@ class BotRunner:
                             log(f"⚠️ avg_price=0 → fallback entry={entry} (initial only)")
 
                         tp_price = tp_price_from_roi(entry, side, float(self.cfg.tp_percent), int(self.cfg.leverage), pp)
-
                         tp_qty = floor_to_step(qty_now, float(step or 1.0))
                         if tp_qty < min_allowed:
                             tp_qty = min_allowed
@@ -342,13 +326,8 @@ class BotRunner:
                         tp_side = "SELL" if side == "BUY" else "BUY"
                         tp_pos  = "LONG" if side == "BUY" else "SHORT"
                         new_tp_id = self.client.place_limit(
-                            self.cfg.symbol,
-                            tp_side,
-                            tp_qty,
-                            tp_price,
-                            reduce_only=False,                 # HEDGE에선 reduceOnly 쓰지 않음
-                            position_side=tp_pos_side,         # "LONG" / "SHORT"
-                            close_position=True                # ✅ 반드시 닫기 전용
+                            self.cfg.symbol, tp_side, tp_qty, tp_price,
+                            reduce_only=False, position_side=tp_pos, close_position=True  # ✅ 닫기전용
                         )
 
                         self.state.tp_order_id = str(new_tp_id)
@@ -373,7 +352,7 @@ class BotRunner:
                     time.sleep(POLL_SEC)
                     self._refresh_position()
 
-                    # 오픈오더 조회(한번만)
+                    # 오픈오더 조회
                     try:
                         open_orders = self.client.open_orders(self.cfg.symbol)
                     except Exception as e:
@@ -403,13 +382,11 @@ class BotRunner:
 
                     really_closed = (zero_streak >= CLOSE_ZERO_STREAK) and (not tp_alive)
                     if really_closed:
-                        # 이중확인
                         try:
                             chk_avg, chk_qty = self.client.position_info(self.cfg.symbol, self.cfg.side)
                         except Exception:
                             chk_avg, chk_qty = 0.0, 0.0
                         if float(chk_qty or 0.0) < zero_eps:
-                            # 정리
                             self._cancel_tracked_limits()
                             if self.state.tp_order_id:
                                 try:
@@ -420,7 +397,7 @@ class BotRunner:
                             log("✅ 포지션 종료 확정(연속검증+이중확인) → 대기")
                             break
                         else:
-                            zero_streak = 0  # 오탐이었다면 초기화
+                            zero_streak = 0
 
                     # ----- TP 재설정(데드밴드 + 쿨다운) -----
                     need_reset_tp = False
@@ -432,10 +409,8 @@ class BotRunner:
                         need_reset_tp = (qty_now >= min_allowed and entry_now > 0)
                     else:
                         if qty_now >= min_allowed and entry_now > 0:
-                            # 이상적 TP
                             ideal_price = tp_price_from_roi(entry_now, side, float(self.cfg.tp_percent), int(self.cfg.leverage), pp)
                             ideal_qty   = max(floor_to_step(qty_now, step), min_allowed)
-                            # 데드밴드
                             if (last_entry is None) or (last_tp_price is None) or (last_tp_qty is None):
                                 need_reset_tp = True
                             elif (abs(entry_now - last_entry) >= 2 * tick) or \
@@ -448,7 +423,6 @@ class BotRunner:
                         if now_ts - last_tp_reset_ts < tp_reset_cooldown:
                             continue
 
-                        # 기존 TP 살아있으면 취소 → 반영 대기
                         if self.state.tp_order_id and tp_alive:
                             try:
                                 self.client.cancel_order(self.cfg.symbol, self.state.tp_order_id)
@@ -467,10 +441,9 @@ class BotRunner:
                         try:
                             new_id = self.client.place_limit(
                                 self.cfg.symbol, new_side, new_qty, new_price,
-                                reduce_only=False, position_side=new_pos
+                                reduce_only=False, position_side=new_pos, close_position=True  # ✅ 항상 닫기전용
                             )
                         except Exception as e:
-                            # 80001(가용 부족)은 보류
                             if "80001" in str(e):
                                 continue
                             else:
@@ -502,7 +475,6 @@ class BotRunner:
                         self.state.tp_order_id = None
                     self.state.reset_orders()
 
-                    # 쿨다운(기본 60초). 정지 신호 들어오면 즉시 중단
                     delay = max(0, RESTART_DELAY_SEC)
                     if delay > 0:
                         log(f"🔁 반복 모드 → {delay}초 대기 후 재시작")

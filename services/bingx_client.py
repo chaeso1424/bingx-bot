@@ -418,30 +418,18 @@ class BingXClient:
         qty: float,
         reduce_only: bool = False,
         position_side: str | None = None,
-        close_position: bool = False,     # ✅ 추가
+        close_position: bool = False,    # ✅ 추가
     ) -> str:
         import math
         url = f"{BASE}/openApi/swap/v2/trade/order"
 
-        # === 정밀도/최소수량/스텝 보정 ===
         pp, qp = self.get_symbol_filters(symbol)
         min_qty = 0.0
         step = 1.0 if qp == 0 else 10 ** (-qp)
         try:
             spec = self.get_contract_spec(symbol)
-            min_qty = float(
-                spec.get("tradeMinQuantity")
-                or spec.get("minQty")
-                or spec.get("minVol")
-                or spec.get("minTradeNum")
-                or 0.0
-            )
-            step = float(
-                spec.get("qtyStep")
-                or spec.get("volumeStep")
-                or spec.get("stepSize")
-                or step
-            )
+            min_qty = float(spec.get("tradeMinQuantity") or spec.get("minQty") or spec.get("minVol") or spec.get("minTradeNum") or 0.0)
+            step    = float(spec.get("qtyStep") or spec.get("volumeStep") or spec.get("stepSize") or step)
         except Exception:
             pass
 
@@ -463,20 +451,23 @@ class BingXClient:
         }
 
         variants = []
-
         if POSITION_MODE == "HEDGE":
-            base["positionSide"] = position_side or ("LONG" if side.upper() == "BUY" else "SHORT")
-            # 닫기 전용(청산 전용) 시도
+            ps = position_side or ("LONG" if side.upper() == "BUY" else "SHORT")
+            base["positionSide"] = ps
             if close_position:
+                # market closePosition는 보통 quantity 없이도 허용
+                v_noqty = {k: v for k, v in base.items() if k != "quantity"}
+                v_noqty["closePosition"] = True
+                variants.append(v_noqty)
                 variants.append({**base, "closePosition": True})
             variants.append(base)
         else:
-            # ONEWAY: reduceOnly로 닫기 전용 효과
             if close_position or reduce_only:
                 variants.append({**base, "reduceOnly": True})
             variants.append(base)
 
         return self._try_order(url, variants)
+
 
 
 
@@ -489,31 +480,20 @@ class BingXClient:
         price: float,
         reduce_only: bool = False,
         position_side: str | None = None,
-        close_position: bool = False,     # ✅ 추가
+        close_position: bool = False,    # ✅ 추가
         tif: str = "GTC",
     ) -> str:
         import math
         url = f"{BASE}/openApi/swap/v2/trade/order"
 
-        # === 정밀도/최소수량/스텝 보정 ===
+        # === 정밀도/최소수량 보정 ===
         pp, qp = self.get_symbol_filters(symbol)
         min_qty = 0.0
         step = 1.0 if qp == 0 else 10 ** (-qp)
         try:
             spec = self.get_contract_spec(symbol)
-            min_qty = float(
-                spec.get("tradeMinQuantity")
-                or spec.get("minQty")
-                or spec.get("minVol")
-                or spec.get("minTradeNum")
-                or 0.0
-            )
-            step = float(
-                spec.get("qtyStep")
-                or spec.get("volumeStep")
-                or spec.get("stepSize")
-                or step
-            )
+            min_qty = float(spec.get("tradeMinQuantity") or spec.get("minQty") or spec.get("minVol") or spec.get("minTradeNum") or 0.0)
+            step    = float(spec.get("qtyStep") or spec.get("volumeStep") or spec.get("stepSize") or step)
         except Exception:
             pass
 
@@ -543,21 +523,32 @@ class BingXClient:
         variants = []
 
         if POSITION_MODE == "HEDGE":
-            base["positionSide"] = position_side or ("LONG" if side.upper() == "BUY" else "SHORT")
-            # 닫기 전용 TP (가장 먼저 시도)
+            ps = position_side or ("LONG" if side.upper() == "BUY" else "SHORT")
+            base["positionSide"] = ps
+
             if close_position:
+                # ① 닫기전용 + 수량 제거 (일부 환경은 closePosition일 때 quantity 금지)
+                v_noqty = {k: v for k, v in base.items() if k != "quantity"}
+                v_noqty["closePosition"] = True
+                variants.append(v_noqty)
+
+                # ② 닫기전용 + 수량 포함 (반대로 수량을 요구하는 환경)
                 variants.append({**base, "closePosition": True})
+
+            # ③ 일반 LIMIT
             variants.append(base)
 
-            # 키 변형도 소극적으로 추가(상황 따라 필요)
+            # ④ 호환형 키 (orderType/qty)
             variants.append({**base, "orderType": "LIMIT", "quantity": None, "qty": qty})
+
         else:
-            # ONEWAY: reduceOnly로 닫기 전용 효과
+            # ONEWAY: 닫기전용 효과는 reduceOnly
             if close_position or reduce_only:
                 variants.append({**base, "reduceOnly": True})
             variants.append(base)
 
         return self._try_order(url, variants)
+
 
 
 
