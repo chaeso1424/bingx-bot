@@ -8,8 +8,8 @@ from urllib.parse import urlencode
 from utils.logging import log
 
 import os
+# --- force IPv4 only for urllib3/requests ---
 import socket
-
 try:
     import urllib3.util.connection as urllib3_cn
     urllib3_cn.allowed_gai_family = lambda: socket.AF_INET
@@ -96,6 +96,7 @@ def _req_post(url: str, body: dict | None = None, signed: bool = False) -> dict:
 
 # ---------- high-level client ----------
 class BingXClient:
+
     def get_current_leverage(self, symbol: str, side: str) -> float | None:
         """
         현재 심볼/사이드의 적용 레버리지(거래소 측 상태)를 조회.
@@ -139,48 +140,7 @@ class BingXClient:
                         return str(o[k])
         return ""
 
-    # (없으면 추가) 심볼 스펙 캐시 + 정규화
-    def get_contract_spec(self, symbol: str) -> dict:
-        if symbol in self._spec_cache:
-            return self._spec_cache[symbol]
-        spec = {"contractSize":1.0,"minQty":0.0,"qtyStep":1.0,"pricePrecision":4,"quantityPrecision":0}
-        try:
-            url = f"{BASE}/openApi/swap/v2/quote/contracts"
-            j = _req_get(url); data = j.get("data", [])
-            for it in data if isinstance(data, list) else []:
-                s = it.get("symbol") or it.get("contractCode") or it.get("symbolName")
-                if s == symbol:
-                    spec["contractSize"]      = float(it.get("contractSize") or it.get("multiplier") or 1.0)
-                    spec["minQty"]            = float(it.get("minQty") or it.get("minVol") or it.get("minTradeNum") or 0.0)
-                    spec["qtyStep"]           = float(it.get("volumeStep") or it.get("stepSize") or 1.0)
-                    spec["pricePrecision"]    = int(it.get("pricePrecision") or it.get("pricePrecisionNum") or 4)
-                    spec["quantityPrecision"] = int(it.get("quantityPrecision") or it.get("volPrecision") or 0)
-                    break
-        except Exception as e:
-            log(f"⚠️ get_contract_spec fallback: {e}")
-        self._spec_cache[symbol] = spec
-        return spec
 
-    def _normalize_qty_price(self, symbol: str, qty, price):
-        import math
-        spec = self.get_contract_spec(symbol)
-        pp = spec["pricePrecision"]; qp = spec["quantityPrecision"]
-        step = spec["qtyStep"] if spec["qtyStep"] > 0 else (1.0 if qp==0 else 10**(-qp))
-        minq = spec["minQty"] if spec["minQty"] > 0 else step
-
-        if qty is not None:
-            qty = math.floor(float(max(qty, 0.0)) / step) * step
-            qty = float(f"{qty:.{max(qp,0)}f}")
-            if qty < minq: qty = minq
-        if price is not None:
-            price = float(f"{float(price):.{max(pp,0)}f}")
-
-        if qty is not None and qty <= 0:
-            raise RuntimeError(f"quantity <= 0 after normalize (min={minq}, step={step}, qp={qp})")
-        if price is not None and price <= 0:
-            raise RuntimeError("price <= 0 after normalize")
-        return qty, price, spec
-    
 
     def get_symbol_filters(self, symbol: str) -> tuple[int, int]:
         """
@@ -205,28 +165,6 @@ class BingXClient:
         if digits < 0: digits = 0
         fmt = f"{{:.{digits}f}}"
         return float(fmt.format(value))
-    
-    # class BingXClient 내부 아무 데나 메서드로 추가
-    def _extract_order_id(self, resp: dict) -> str:
-        # 최상위
-        for k in ("orderId", "orderID", "id"):
-            if k in resp and resp[k]:
-                return str(resp[k])
-
-        data = resp.get("data")
-        if isinstance(data, dict):
-            # data 바로 아래
-            for k in ("orderId", "orderID", "id"):
-                if k in data and data[k]:
-                    return str(data[k])
-            # data.order 아래
-            o = data.get("order")
-            if isinstance(o, dict):
-                for k in ("orderId", "orderID", "id", "order_id"):
-                    if k in o and o[k]:
-                        return str(o[k])
-
-        return ""
 
     
     # BingXClient 클래스 안에 추가
@@ -473,8 +411,15 @@ class BingXClient:
                     log(f"⚠️ set_leverage(alt,{s},{url}) failed: {e2}")
 
     # ----- Orders / Positions -----
-    def place_market(self, symbol: str, side: str, qty: float,
-                    reduce_only: bool=False, position_side: str|None=None) -> str:
+    def place_market(
+        self,
+        symbol: str,
+        side: str,
+        qty: float,
+        reduce_only: bool = False,
+        position_side: str | None = None,
+        close_position: bool = False,     # ✅ 추가
+    ) -> str:
         import math
         url = f"{BASE}/openApi/swap/v2/trade/order"
 
@@ -484,7 +429,6 @@ class BingXClient:
         step = 1.0 if qp == 0 else 10 ** (-qp)
         try:
             spec = self.get_contract_spec(symbol)
-            # 다양한 키 대응
             min_qty = float(
                 spec.get("tradeMinQuantity")
                 or spec.get("minQty")
@@ -502,64 +446,52 @@ class BingXClient:
             pass
 
         qty = max(qty, 0.0)
-        # 스텝 내림
         qty = math.floor(qty / step) * step
-        # 자리수 보정
         qty = float(f"{qty:.{max(qp,0)}f}")
-        # 최소수량 보정
         if qty < (min_qty or step):
             qty = (min_qty or step)
         if qty <= 0:
             raise RuntimeError(f"quantity <= 0 after precision adjust (qp={qp}, min={min_qty}, step={step})")
 
-        # === 페이로드 ===
         base = {
-            "symbol": symbol,          # "DOGE-USDT"
+            "symbol": symbol,
             "type": "MARKET",
-            "side": side.upper(),      # BUY / SELL
+            "side": side.upper(),
             "quantity": qty,
             "recvWindow": 60000,
             "timestamp": _ts(),
         }
-        # HEDGE면 reduceOnly 금지, positionSide만
+
+        variants = []
+
         if POSITION_MODE == "HEDGE":
-            base["positionSide"] = position_side or ("LONG" if side.upper()=="BUY" else "SHORT")
+            base["positionSide"] = position_side or ("LONG" if side.upper() == "BUY" else "SHORT")
+            # 닫기 전용(청산 전용) 시도
+            if close_position:
+                variants.append({**base, "closePosition": True})
+            variants.append(base)
         else:
-            if reduce_only:
-                base["reduceOnly"] = True
+            # ONEWAY: reduceOnly로 닫기 전용 효과
+            if close_position or reduce_only:
+                variants.append({**base, "reduceOnly": True})
+            variants.append(base)
 
-        # === 요청/응답 파싱 ===
-        j = _req_post(url, base, signed=True)
-
-        # orderId 추출 (data.order.orderId 형태 대응)
-        oid = None
-        if isinstance(j, dict):
-            oid = j.get("orderId") or j.get("id")
-            if not oid:
-                d = j.get("data") or {}
-                if isinstance(d, dict):
-                    oid = d.get("orderId") or d.get("orderID") or d.get("id")
-                    if not oid:
-                        o = d.get("order") or {}
-                        if isinstance(o, dict):
-                            oid = o.get("orderId") or o.get("orderID") or o.get("id") or o.get("order_id")
-        if not oid:
-            raise RuntimeError(f"market order no orderId: {j}")
-
-        # (선택) 체결 로그
-        try:
-            o = j.get("data", {}).get("order", {})
-            log(f"✅ market filled: id={oid} avg={o.get('avgPrice')} qty={o.get('executedQty')}")
-        except Exception:
-            pass
-
-        return str(oid)
+        return self._try_order(url, variants)
 
 
 
-    def place_limit(self, symbol: str, side: str, qty: float, price: float,
-                    reduce_only: bool=False, position_side: str|None=None,
-                    tif: str="GTC") -> str:
+
+    def place_limit(
+        self,
+        symbol: str,
+        side: str,
+        qty: float,
+        price: float,
+        reduce_only: bool = False,
+        position_side: str | None = None,
+        close_position: bool = False,     # ✅ 추가
+        tif: str = "GTC",
+    ) -> str:
         import math
         url = f"{BASE}/openApi/swap/v2/trade/order"
 
@@ -597,42 +529,36 @@ class BingXClient:
         if price <= 0:
             raise RuntimeError("price <= 0 (tp/limit)")
 
-        # === 페이로드 ===
         base = {
             "symbol": symbol,
             "type": "LIMIT",
             "side": side.upper(),
             "quantity": qty,
             "price": price,
-            "timeInForce": tif,   # GTC
+            "timeInForce": tif,
             "recvWindow": 60000,
             "timestamp": _ts(),
         }
-        # HEDGE면 reduceOnly 금지, positionSide만
+
+        variants = []
+
         if POSITION_MODE == "HEDGE":
-            base["positionSide"] = position_side or ("LONG" if side.upper()=="BUY" else "SHORT")
+            base["positionSide"] = position_side or ("LONG" if side.upper() == "BUY" else "SHORT")
+            # 닫기 전용 TP (가장 먼저 시도)
+            if close_position:
+                variants.append({**base, "closePosition": True})
+            variants.append(base)
+
+            # 키 변형도 소극적으로 추가(상황 따라 필요)
+            variants.append({**base, "orderType": "LIMIT", "quantity": None, "qty": qty})
         else:
-            if reduce_only:
-                base["reduceOnly"] = True
+            # ONEWAY: reduceOnly로 닫기 전용 효과
+            if close_position or reduce_only:
+                variants.append({**base, "reduceOnly": True})
+            variants.append(base)
 
-        # === 요청/응답 파싱 ===
-        j = _req_post(url, base, signed=True)
+        return self._try_order(url, variants)
 
-        oid = None
-        if isinstance(j, dict):
-            oid = j.get("orderId") or j.get("id")
-            if not oid:
-                d = j.get("data") or {}
-                if isinstance(d, dict):
-                    oid = d.get("orderId") or d.get("orderID") or d.get("id")
-                    if not oid:
-                        o = d.get("order") or {}
-                        if isinstance(o, dict):
-                            oid = o.get("orderId") or o.get("orderID") or o.get("id") or o.get("order_id")
-        if not oid:
-            raise RuntimeError(f"limit order no orderId: {j}")
-
-        return str(oid)
 
 
 

@@ -342,9 +342,15 @@ class BotRunner:
                         tp_side = "SELL" if side == "BUY" else "BUY"
                         tp_pos  = "LONG" if side == "BUY" else "SHORT"
                         new_tp_id = self.client.place_limit(
-                            self.cfg.symbol, tp_side, tp_qty, tp_price,
-                            reduce_only=False, position_side=tp_pos
+                            self.cfg.symbol,
+                            tp_side,
+                            tp_qty,
+                            tp_price,
+                            reduce_only=False,                 # HEDGE에선 reduceOnly 쓰지 않음
+                            position_side=tp_pos_side,         # "LONG" / "SHORT"
+                            close_position=True                # ✅ 반드시 닫기 전용
                         )
+
                         self.state.tp_order_id = str(new_tp_id)
                         last_entry = entry
                         last_tp_price = tp_price
