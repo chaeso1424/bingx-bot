@@ -43,9 +43,9 @@ def _req_get(url: str, params: dict | None = None, signed: bool = False) -> dict
     params = params or {}
     if signed:
         qs = _sign(params)
-        r = requests.get(url + "?" + qs, headers=_headers(), timeout=50)
+        r = requests.get(url + "?" + qs, headers=_headers(), timeout=(3, 30))
     else:
-        r = requests.get(url, params=params, headers=_headers(), timeout=50)
+        r = requests.get(url, params=params, headers=_headers(), timeout=(3, 30))
     try:
         j = r.json()
     except Exception:
@@ -62,9 +62,9 @@ def _req_delete(url: str, params: dict | None = None, signed: bool = False) -> d
     params = params or {}
     if signed:
         qs = _sign(params)
-        r = requests.delete(url + "?" + qs, headers=_headers(form=True), timeout=50)
+        r = requests.delete(url + "?" + qs, headers=_headers(form=True), timeout=(3, 30))
     else:
-        r = requests.delete(url, params=params, headers=_headers(form=False), timeout=50)
+        r = requests.delete(url, params=params, headers=_headers(form=False), timeout=(3, 30))
     j = r.json()
     code = str(j.get("code", "0"))
     if code != "0":
@@ -75,9 +75,9 @@ def _req_post(url: str, body: dict | None = None, signed: bool = False) -> dict:
     body = body or {}
     if signed:
         payload = _sign(body)  # querystring + signature
-        r = requests.post(url, data=payload, headers=_headers(form=True), timeout=50)
+        r = requests.post(url, data=payload, headers=_headers(form=True), timeout=(3, 30))
     else:
-        r = requests.post(url, json=body, headers=_headers(form=False), timeout=50)
+        r = requests.post(url, json=body, headers=_headers(form=False), timeout=(3, 30))
     j = r.json()
     code = str(j.get("code", "0"))
     if code != "0":

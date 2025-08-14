@@ -8,6 +8,10 @@ from models.state import BotState
 from services.bingx_client import BingXClient
 import os
 
+RESTART_DELAY_SEC   = int(os.getenv("RESTART_DELAY_SEC", "60"))  # TP 후 대기 (이미 쓰고 있으면 그대로)
+CLOSE_ZERO_STREAK   = int(os.getenv("CLOSE_ZERO_STREAK", "3"))   # 종료 판단에 필요한 연속 0회수
+ZERO_EPS_FACTOR     = float(os.getenv("ZERO_EPS_FACTOR", "0.5")) # 0 판정 여유 (min_live_qty의 50%)
+
 
 RESTART_DELAY_SEC = int(os.getenv("RESTART_DELAY_SEC", "60"))
 POLL_SEC = 1.5
@@ -199,6 +203,19 @@ class BotRunner:
                     log(f"⚠️ 1차 수량이 최소수량 미달(raw={raw_qty}) → {max(min_qty, step)}로 보정")
                     qty = max(min_qty, step)
 
+                # --- 사이클 시작 전 포지션 존재 여부 확인 (오탐 진입 방지) ---
+                try:
+                    pre_avg, pre_qty = self.client.position_info(self.cfg.symbol, self.cfg.side)
+                except Exception:
+                    pre_avg, pre_qty = 0.0, 0.0
+
+                # 심볼 스펙(아래에서 이미 계산했다면 그 값 그대로 사용)
+                min_live_qty = max(min_qty or 0.0, step)
+                if float(pre_qty) >= (min_live_qty * ZERO_EPS_FACTOR):
+                    log(f"⛔ 기존 포지션 감지(qty={pre_qty}) → 새 진입 중단")
+                    # 여기서 기존 DCA/TP는 유지. 재설정만 필요하면 이후 루프에서 TP 재설정 로직이 수행됨.
+                    return
+                
                 oid = self.client.place_market(self.cfg.symbol, side, qty)
                 if not oid:
                     raise RuntimeError("market order failed: no orderId")
@@ -221,61 +238,83 @@ class BotRunner:
                     self.state.open_limit_ids.append(str(lid))
                     log(f"🧩 {i}차 리밋: id={lid}, price={price}, qty={q}, 투입≈{usdt_amt}USDT")
 
-                # 4) 초기 TP 세팅
+
+                # 4) 초기 TP 세팅 (강화판: 최소단위/데드밴드/기존TP유지)
                 self._refresh_position()
-                if self.state.position_qty > 0:
-                    # entry: 평균가(초기 0이면 1회에 한해 마크로 대체)
+
+                pp = int(pp) if 'pp' in locals() else int(getattr(self.cfg, 'price_precision', 4))
+                tick = 10 ** (-pp) if pp > 0 else 0.01
+                min_allowed = max(float(min_qty or 0.0), float(step or 0.0), tick)
+
+                qty_now = float(self.state.position_qty or 0.0)
+
+                if qty_now >= min_allowed:
+                    # entry: 평균가(0이면 최초 1회만 마크/라스트로 대체)
                     entry = float(self.state.position_avg_price or 0.0)
                     if entry <= 0:
                         try:
                             entry = float(self.client.get_mark_price(self.cfg.symbol))
                         except Exception:
                             entry = float(self.client.get_last_price(self.cfg.symbol))
-                        log(f"⚠️ avg_price=0 → fallback entry={entry} (mark, initial only)")
+                        log(f"⚠️ avg_price=0 → fallback entry={entry} (initial only)")
 
-                    # ✅ 레버리지 기준 ROI로 TP 가격 계산 + 틱 보정(롱=내림, 숏=올림)
-                    tp_price = tp_price_from_roi(entry, side, self.cfg.tp_percent, self.cfg.leverage, pp)
+                    # ✅ 레버리지 기준 ROI로 TP 가격 계산 + 틱 보정(롱=내림, 숏=올림) - 함수가 처리
+                    tp_price = tp_price_from_roi(entry, side, float(self.cfg.tp_percent), int(self.cfg.leverage), pp)
 
-                    tp_qty = floor_to_step(float(self.state.position_qty), step)
-                    tp_qty = max(tp_qty, max(min_qty or 0.0, step))
+                    # 수량: 스텝 내림 → 최소 허용 이상으로 보정
+                    tp_qty = floor_to_step(qty_now, float(step or 1.0))
+                    if tp_qty < min_allowed:
+                        tp_qty = min_allowed
 
                     if tp_price <= 0:
                         raise RuntimeError(f"TP price invalid: {tp_price}")
                     if tp_qty <= 0:
                         raise RuntimeError(f"TP qty invalid: {tp_qty}")
 
-                    tp_side = "SELL" if side == "BUY" else "BUY"
-                    tp_pos_side = "LONG" if side == "BUY" else "SHORT"
+                    # ── 기존 TP가 '살아있고' 변화가 미미하면 재배치 스킵(데드밴드) ──
+                    skip_place = False
+                    tp_alive = False
+                    if self.state.tp_order_id:
+                        try:
+                            oo = self.client.open_orders(self.cfg.symbol)
+                            want = str(self.state.tp_order_id)
+                            tp_alive = any(str(o.get("orderId") or o.get("orderID") or o.get("id") or "") == want for o in oo)
+                        except Exception:
+                            tp_alive = False
 
-                    try:
-                        tp_id = self.client.place_limit(
-                            self.cfg.symbol,
-                            tp_side,
-                            tp_qty,
-                            tp_price,
-                            reduce_only=False,   # HEDGE에서는 reduceOnly 금지
-                            position_side=tp_pos_side
-                        )
-                    except Exception as e:
-                        if "80001" in str(e):
-                            log("⏭️ TP 배치 보류: 가용 증거금 부족(80001). 이후 루프에서 재시도.")
-                            tp_id = None
-                        else:
-                            raise
-                    self.state.tp_order_id = str(tp_id) if tp_id else None
-                    if tp_id:
-                        log(f"🎯 TP 배치 완료: id={tp_id}, price={tp_price}, qty={tp_qty}, side={tp_side}/{tp_pos_side}")
+                    if tp_alive and ('last_tp_price' in locals()) and (last_tp_price is not None):
+                        price_changed = abs(tp_price - last_tp_price) >= (2 * tick)   # 가격 2틱 이상 변하면 갱신
+                        qty_changed   = abs(tp_qty - (last_tp_qty or 0.0)) >= float(step or 1.0)  # 수량 한 스텝 이상 변하면 갱신
+                        if not (price_changed or qty_changed):
+                            skip_place = True
 
+                    if skip_place:
+                        log("⏭️ 기존 TP 유지(변화 미미)")
+                    else:
+                        tp_side = "SELL" if side == "BUY" else "BUY"
+                        tp_pos_side = "LONG" if side == "BUY" else "SHORT"
+                        try:
+                            new_tp_id = self.client.place_limit(
+                                self.cfg.symbol, tp_side, tp_qty, tp_price,
+                                reduce_only=False, position_side=tp_pos_side
+                            )
+                            self.state.tp_order_id = str(new_tp_id)
+                            last_tp_price = tp_price
+                            last_tp_qty   = tp_qty
+                            log(f"🎯 TP 배치 완료: id={new_tp_id}, price={tp_price}, qty={tp_qty}, side={tp_side}/{tp_pos_side}")
+                        except Exception as e:
+                            if "80001" in str(e):
+                                log("⏭️ TP 보류: 가용 증거금 부족(80001). 이후 루프에서 재시도.")
+                            else:
+                                raise
 
-                    # 모니터링 기준값
                     last_entry = entry
-                    last_tp_price = tp_price if tp_id else None
-                    last_tp_qty = tp_qty if tp_id else None
                 else:
-                    log("ℹ️ 포지션 없음 → TP 생략")
+                    log("ℹ️ 포지션 없음 또는 최소단위 미만 → TP 생략")
                     last_entry = None
                     last_tp_price = None
                     last_tp_qty = None
+
 
                 # 5) 모니터링 루프: 리밋 체결 시 TP 재조정, 포지션 청산 시 정리
                 tp_reset_cooldown = 3.0
@@ -376,7 +415,6 @@ class BotRunner:
                             )
                         except Exception as e:
                             if "80001" in str(e):
-                                log("⏭️ TP 재설정 보류: 가용 증거금 부족(80001). 기존 TP 유지.")
                                 continue
                             else:
                                 raise
