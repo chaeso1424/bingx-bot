@@ -8,6 +8,14 @@ from urllib.parse import urlencode
 from utils.logging import log
 
 import os
+import socket
+
+try:
+    import urllib3.util.connection as urllib3_cn
+    urllib3_cn.allowed_gai_family = lambda: socket.AF_INET
+except Exception:
+    pass
+
 SKIP_SETUP = os.getenv("SKIP_SETUP", "false").lower() == "true"
 
 API_KEY = os.getenv("BINGX_API_KEY", "")
