@@ -167,7 +167,7 @@ class BotRunner:
         tp_pos  = "LONG" if side.upper() == "BUY" else "SHORT"
         new_id = self.client.place_limit(
             self.cfg.symbol, tp_side, tp_qty, tp_price,
-            reduce_only=False, position_side=tp_pos, close_position=True   # ✅ 닫기전용
+            reduce_only=True, position_side=tp_pos
         )
         self.state.tp_order_id = str(new_id)
         self._last_tp_price = tp_price
@@ -327,7 +327,7 @@ class BotRunner:
                         tp_pos  = "LONG" if side == "BUY" else "SHORT"
                         new_tp_id = self.client.place_limit(
                             self.cfg.symbol, tp_side, tp_qty, tp_price,
-                            reduce_only=False, position_side=tp_pos, close_position=True  # ✅ 닫기전용
+                            reduce_only=True, position_side=tp_pos
                         )
 
                         self.state.tp_order_id = str(new_tp_id)
@@ -441,7 +441,7 @@ class BotRunner:
                         try:
                             new_id = self.client.place_limit(
                                 self.cfg.symbol, new_side, new_qty, new_price,
-                                reduce_only=False, position_side=new_pos, close_position=True  # ✅ 항상 닫기전용
+                                reduce_only=True, position_side=new_pos
                             )
                         except Exception as e:
                             if "80001" in str(e):
