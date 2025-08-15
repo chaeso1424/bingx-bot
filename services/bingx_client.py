@@ -433,15 +433,15 @@ class BingXClient:
         import math
         url = f"{BASE}/openApi/swap/v2/trade/order"
 
+        # === 정밀도/최소수량/스텝 보정 ===
         pp, qp = self.get_symbol_filters(symbol)
-        min_qty = 0.0
         step = 1.0 if qp == 0 else 10 ** (-qp)
         try:
             spec = self.get_contract_spec(symbol)
-            min_qty = float(spec.get("tradeMinQuantity") or spec.get("minQty") or 0.0)
-            step = float(spec.get("qtyStep") or step)
+            min_qty = float(spec.get("tradeMinQuantity") or spec.get("minQty") or spec.get("minVol") or spec.get("minTradeNum") or 0.0)
+            step    = float(spec.get("qtyStep") or spec.get("volumeStep") or spec.get("stepSize") or step)
         except Exception:
-            pass
+            min_qty = 0.0
 
         qty = max(qty, 0.0)
         qty = math.floor(qty / step) * step
@@ -449,24 +449,36 @@ class BingXClient:
         if qty < (min_qty or step):
             qty = (min_qty or step)
         if qty <= 0:
-            raise RuntimeError(f"quantity <= 0 (market) after adjust (qp={qp}, min={min_qty}, step={step})")
+            raise RuntimeError(f"quantity <= 0 after adjust (qp={qp}, min={min_qty}, step={step})")
 
         base = {
             "symbol": symbol,
             "type": "MARKET",
-            "side": side.upper(),
+            "side": side.upper(),             # BUY/SELL
             "quantity": qty,
             "recvWindow": 60000,
             "timestamp": _ts(),
         }
-        if position_side:
-            base["positionSide"] = position_side
-        variants = [base]
 
-        # (참고: closePosition/ reduceOnly 는 MARKET-클로징에만 필요할 수 있는데
-        # 현재 코드는 진입용으로만 사용하므로 생략)
+        if POSITION_MODE == "HEDGE":
+            # ✅ 항상 넣기 (기본값 LONG/SHORT)
+            ps = (position_side or ("LONG" if side.upper()=="BUY" else "SHORT")).upper()
+            base["positionSide"] = ps
+            # HEDGE에서는 reduceOnly는 넣지 않는 편이 안전
+        else:
+            if reduce_only:
+                base["reduceOnly"] = True
+
+        # close 포지션용 변형(필요시)
+        variants = []
+        if close_position:
+            v = dict(base)
+            v["closePosition"] = "true"   # ← 문자열
+            variants.append(v)
+        variants.append(base)
 
         return self._try_order(url, variants)
+
 
     def place_limit(self, symbol: str, side: str, qty: float, price: float,
                     reduce_only: bool=False, position_side: str|None=None,
@@ -476,25 +488,13 @@ class BingXClient:
 
         # === 정밀도/최소수량/스텝 보정 ===
         pp, qp = self.get_symbol_filters(symbol)
-        min_qty = 0.0
         step = 1.0 if qp == 0 else 10 ** (-qp)
         try:
             spec = self.get_contract_spec(symbol)
-            min_qty = float(
-                spec.get("tradeMinQuantity")
-                or spec.get("minQty")
-                or spec.get("minVol")
-                or spec.get("minTradeNum")
-                or 0.0
-            )
-            step = float(
-                spec.get("qtyStep")
-                or spec.get("volumeStep")
-                or spec.get("stepSize")
-                or step
-            )
+            min_qty = float(spec.get("tradeMinQuantity") or spec.get("minQty") or spec.get("minVol") or spec.get("minTradeNum") or 0.0)
+            step    = float(spec.get("qtyStep") or spec.get("volumeStep") or spec.get("stepSize") or step)
         except Exception:
-            pass
+            min_qty = 0.0
 
         qty = max(qty, 0.0)
         qty = math.floor(qty / step) * step
@@ -508,7 +508,6 @@ class BingXClient:
         if price <= 0:
             raise RuntimeError("price <= 0 (limit)")
 
-        # === 기본 페이로드 ===
         base = {
             "symbol": symbol,
             "type": "LIMIT",
@@ -520,36 +519,21 @@ class BingXClient:
             "timestamp": _ts(),
         }
 
-        # positionSide는 있으면 항상 싣기 (HEDGE 안정성)
-        if position_side:
-            base["positionSide"] = position_side
+        if POSITION_MODE == "HEDGE":
+            ps = (position_side or ("LONG" if side.upper()=="BUY" else "SHORT")).upper()
+            base["positionSide"] = ps
+        else:
+            if reduce_only:
+                base["reduceOnly"] = True
 
-        # ---- 변형들을 순차 시도 (성공하는 첫 번째로 확정) ----
         variants = []
-
-        # 1) positionSide + reduceOnly (가장 안전: 증거금 예약 최소)
-        vo = base.copy()
-        vo["reduceOnly"] = True
-        variants.append(vo)
-
-        # 2) positionSide + closePosition (거래소에 따라 허용)
-        vo = base.copy()
-        vo["closePosition"] = True
-        variants.append(vo)
-
-        # 3) reduceOnly (positionSide 없이) - 일부 환경 호환
-        vo = base.copy()
-        vo["reduceOnly"] = True
-        variants.append(vo)
-
-        # 4) 마지막 백업: base (일반 LIMIT)
+        if close_position:
+            v = dict(base)
+            v["closePosition"] = "true"   # ← 문자열
+            variants.append(v)
         variants.append(base)
 
         return self._try_order(url, variants)
-
-
-
-
 
 
 
