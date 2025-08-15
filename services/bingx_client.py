@@ -141,20 +141,39 @@ class BingXClient:
 
     # (없으면 추가) 주문 응답에서 orderId 추출
     def _extract_order_id(self, resp: dict) -> str:
+        """
+        BingX 주문 응답에서 orderId를 최대한 유연하게 추출한다.
+        지원 케이스:
+        - resp["orderId"] / resp["id"]
+        - resp["data"]["orderId"] / resp["data"]["id"]
+        - resp["data"]["order"]["orderId"] / ["orderID"] / ["id"]
+        """
+        if not isinstance(resp, dict):
+            return ""
+
+        # 최상위
         for k in ("orderId", "orderID", "id"):
-            if k in resp and resp[k]:
-                return str(resp[k])
-        d = resp.get("data", {})
+            v = resp.get(k)
+            if v:
+                return str(v)
+
+        d = resp.get("data")
         if isinstance(d, dict):
+            # data 바로 아래
             for k in ("orderId", "orderID", "id"):
-                if k in d and d[k]:
-                    return str(d[k])
+                v = d.get(k)
+                if v:
+                    return str(v)
+            # data.order 아래
             o = d.get("order")
             if isinstance(o, dict):
                 for k in ("orderId", "orderID", "id", "order_id"):
-                    if k in o and o[k]:
-                        return str(o[k])
+                    v = o.get(k)
+                    if v:
+                        return str(v)
+
         return ""
+
 
 
 
@@ -237,16 +256,25 @@ class BingXClient:
         for body in variants:
             try:
                 j = _req_post(url, body, signed=True)
-                data = j.get("data", j)
-                oid = (isinstance(data, dict) and (data.get("orderId") or data.get("id"))) or j.get("orderId")
+                oid = self._extract_order_id(j)  # ✅ 응답에서 안전하게 추출
                 if oid:
                     return str(oid)
+                # 그래도 못 찾았으면 한 번 더 data.order까지 직접 확인
+                try:
+                    o = (j.get("data") or {}).get("order") or {}
+                    oid = o.get("orderId") or o.get("orderID") or o.get("id")
+                except Exception:
+                    oid = None
+                if oid:
+                    return str(oid)
+
                 last_err = RuntimeError(f"missing orderId in response: {j}")
             except Exception as e:
                 last_err = e
                 log(f"⚠️ order variant failed: {e}")
                 continue
         raise last_err or RuntimeError("all order variants failed")
+
 
     # ----- Market / Quote -----
     def list_symbols(self) -> list[str]:
