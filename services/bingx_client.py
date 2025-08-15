@@ -46,10 +46,24 @@ def _sign(params: dict) -> str:
     sig = hmac.new(API_SECRET.encode("utf-8"), qs.encode("utf-8"), hashlib.sha256).hexdigest()
     return qs + "&signature=" + sig
 
+# --- normalize payload for signed requests (bool -> "true"/"false") ---
+def _coerce_params(d: dict | None) -> dict:
+    out = {}
+    for k, v in (d or {}).items():
+        if isinstance(v, bool):
+            out[k] = "true" if v else "false"
+        elif v is None:
+            # 서명 파라미터에 None은 넣지 않음
+            continue
+        else:
+            out[k] = v
+    return out
+
 
 def _req_get(url: str, params: dict | None = None, signed: bool = False) -> dict:
     params = params or {}
     if signed:
+        params = _coerce_params(params)          # ← 추가
         qs = _sign(params)
         r = requests.get(url + "?" + qs, headers=_headers(), timeout=(3, 30))
     else:
@@ -69,6 +83,7 @@ def _req_get(url: str, params: dict | None = None, signed: bool = False) -> dict
 def _req_delete(url: str, params: dict | None = None, signed: bool = False) -> dict:
     params = params or {}
     if signed:
+        params = _coerce_params(params)          # ← 추가
         qs = _sign(params)
         r = requests.delete(url + "?" + qs, headers=_headers(form=True), timeout=(3, 30))
     else:
@@ -82,7 +97,8 @@ def _req_delete(url: str, params: dict | None = None, signed: bool = False) -> d
 def _req_post(url: str, body: dict | None = None, signed: bool = False) -> dict:
     body = body or {}
     if signed:
-        payload = _sign(body)  # querystring + signature
+        body = _coerce_params(body)              # ← 추가
+        payload = _sign(body)                    # querystring + signature
         r = requests.post(url, data=payload, headers=_headers(form=True), timeout=(3, 30))
     else:
         r = requests.post(url, json=body, headers=_headers(form=False), timeout=(3, 30))
@@ -452,18 +468,10 @@ class BingXClient:
 
         variants = []
         if POSITION_MODE == "HEDGE":
-            ps = position_side or ("LONG" if side.upper() == "BUY" else "SHORT")
-            base["positionSide"] = ps
             if close_position:
-                # market closePosition는 보통 quantity 없이도 허용
-                v_noqty = {k: v for k, v in base.items() if k != "quantity"}
-                v_noqty["closePosition"] = True
-                variants.append(v_noqty)
-                variants.append({**base, "closePosition": True})
-            variants.append(base)
-        else:
-            if close_position or reduce_only:
-                variants.append({**base, "reduceOnly": True})
+                v = dict(base)
+                v["closePosition"] = "true"   # ← True가 아니라 "true"
+                variants.insert(0, v)
             variants.append(base)
 
         return self._try_order(url, variants)
@@ -472,28 +480,31 @@ class BingXClient:
 
 
 
-    def place_limit(
-        self,
-        symbol: str,
-        side: str,
-        qty: float,
-        price: float,
-        reduce_only: bool = False,
-        position_side: str | None = None,
-        close_position: bool = False,    # ✅ 추가
-        tif: str = "GTC",
-    ) -> str:
+    def place_limit(self, symbol: str, side: str, qty: float, price: float,
+                    reduce_only: bool=False, position_side: str|None=None,
+                    tif: str="GTC", close_position: bool=False) -> str:
         import math
         url = f"{BASE}/openApi/swap/v2/trade/order"
 
-        # === 정밀도/최소수량 보정 ===
+        # === 정밀도/최소수량/스텝 보정 ===
         pp, qp = self.get_symbol_filters(symbol)
         min_qty = 0.0
         step = 1.0 if qp == 0 else 10 ** (-qp)
         try:
             spec = self.get_contract_spec(symbol)
-            min_qty = float(spec.get("tradeMinQuantity") or spec.get("minQty") or spec.get("minVol") or spec.get("minTradeNum") or 0.0)
-            step    = float(spec.get("qtyStep") or spec.get("volumeStep") or spec.get("stepSize") or step)
+            min_qty = float(
+                spec.get("tradeMinQuantity")
+                or spec.get("minQty")
+                or spec.get("minVol")
+                or spec.get("minTradeNum")
+                or 0.0
+            )
+            step = float(
+                spec.get("qtyStep")
+                or spec.get("volumeStep")
+                or spec.get("stepSize")
+                or step
+            )
         except Exception:
             pass
 
@@ -509,45 +520,34 @@ class BingXClient:
         if price <= 0:
             raise RuntimeError("price <= 0 (tp/limit)")
 
+        # === 기본 payload (closePosition은 여기 넣지 않음) ===
         base = {
             "symbol": symbol,
             "type": "LIMIT",
             "side": side.upper(),
             "quantity": qty,
             "price": price,
-            "timeInForce": tif,
+            "timeInForce": tif,   # GTC
             "recvWindow": 60000,
             "timestamp": _ts(),
         }
-
-        variants = []
-
         if POSITION_MODE == "HEDGE":
-            ps = position_side or ("LONG" if side.upper() == "BUY" else "SHORT")
-            base["positionSide"] = ps
-
-            if close_position:
-                # ① 닫기전용 + 수량 제거 (일부 환경은 closePosition일 때 quantity 금지)
-                v_noqty = {k: v for k, v in base.items() if k != "quantity"}
-                v_noqty["closePosition"] = True
-                variants.append(v_noqty)
-
-                # ② 닫기전용 + 수량 포함 (반대로 수량을 요구하는 환경)
-                variants.append({**base, "closePosition": True})
-
-            # ③ 일반 LIMIT
-            variants.append(base)
-
-            # ④ 호환형 키 (orderType/qty)
-            variants.append({**base, "orderType": "LIMIT", "quantity": None, "qty": qty})
-
+            base["positionSide"] = position_side or ("LONG" if side.upper()=="BUY" else "SHORT")
+            # reduceOnly는 HEDGE에서 거절되는 경우 많으므로 넣지 않음
         else:
-            # ONEWAY: 닫기전용 효과는 reduceOnly
-            if close_position or reduce_only:
-                variants.append({**base, "reduceOnly": True})
-            variants.append(base)
+            if reduce_only:
+                base["reduceOnly"] = True
+
+        # === 여러 변형 시도: closePosition 우선 → 일반 ===
+        variants = []
+        if close_position:
+            v = dict(base)
+            v["closePosition"] = "true"       # ← 문자열로!
+            variants.append(v)
+        variants.append(base)                 # 일반 LIMIT
 
         return self._try_order(url, variants)
+
 
 
 
