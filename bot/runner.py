@@ -110,19 +110,29 @@ class BotRunner:
                 log(f"⚠️ 리밋 취소 실패: {oid} {e}")
         self.state.open_limit_ids.clear()
 
-    def _ensure_tp_for_current_position(self, pp:int, step:float, min_qty:float, side:str):
+    # bot/runner.py
+
+    def _ensure_tp_for_current_position(self, pp: int, step: float, min_qty: float, side: str):
         """
-        현재 보유 포지션(평단/수량)을 기준으로 TP 주문을 확보/재설정한다.
-        - DCA/시장가 진입은 하지 않음
-        - 기존 TP가 살아있고 변화가 미미하면 유지(데드밴드)
+        현재 보유 포지션에 대해 TP(닫기 전용 리밋)를 확보/재설정한다.
+        - DCA/시장가 진입은 절대 하지 않음
+        - 기존 TP가 살아있으면 먼저 취소하고 openOrders에서 사라질 때까지 잠깐 대기
+        - 80001(증거금 부족) 시, 우리가 추적 중인 DCA 리밋만 정리 후 1회 재시도
         """
+        # 미리 초기화(분기 누락으로 인한 '정의되지 않음' 경고 제거)
+        tp_price = None
+        tp_qty   = None
+        tp_side  = None
+        tp_pos   = None
+
         tick = 10 ** (-pp) if pp > 0 else 0.01
         min_allowed = max(float(min_qty or 0.0), float(step or 0.0), tick)
 
         qty_now = float(self.state.position_qty or 0.0)
         if qty_now < min_allowed:
-            return
+            return  # 최소 단위 미만이면 TP 만들지 않음
 
+        # entry: 평균가(0이면 1회 한정 mark/last로 대체)
         entry = float(self.state.position_avg_price or 0.0)
         if entry <= 0:
             try:
@@ -130,49 +140,63 @@ class BotRunner:
             except Exception:
                 entry = float(self.client.get_last_price(self.cfg.symbol))
 
+        # 목표 TP 가격/수량(레버리지 ROI 반영 + 스텝 보정)
         tp_price = tp_price_from_roi(entry, side, float(self.cfg.tp_percent), int(self.cfg.leverage), pp)
-        tp_qty = floor_to_step(qty_now, float(step or 1.0))
+        tp_qty   = floor_to_step(qty_now, float(step or 1.0))
         if tp_qty < min_allowed:
             tp_qty = min_allowed
-        if not (tp_price and tp_price > 0):
-            return
-
-        price_changed = True
-        qty_changed   = True
-        if self.state.tp_order_id:
-            try:
-                oo = self.client.open_orders(self.cfg.symbol)
-                want = str(self.state.tp_order_id)
-                alive = any(str(o.get("orderId") or o.get("orderID") or o.get("id") or "") == want for o in oo)
-            except Exception:
-                alive = False
-
-            if alive:
-                last_price = self._last_tp_price
-                last_qty   = self._last_tp_qty
-                if (last_price is not None) and (abs(tp_price - last_price) < 2 * tick):
-                    price_changed = False
-                if (last_qty is not None) and (abs(tp_qty - last_qty)   < float(step or 1.0)):
-                    qty_changed = False
-                if not (price_changed or qty_changed):
-                    return
-                else:
-                    try:
-                        self.client.cancel_order(self.cfg.symbol, self.state.tp_order_id)
-                    except Exception:
-                        pass
-                    self.state.tp_order_id = None
+        if tp_price <= 0 or tp_qty <= 0:
+            return  # 계산 실패 시 안전 탈출
 
         tp_side = "SELL" if side.upper() == "BUY" else "BUY"
         tp_pos  = "LONG" if side.upper() == "BUY" else "SHORT"
-        new_id = self.client.place_limit(
-            self.cfg.symbol, tp_side, tp_qty, tp_price,
-            reduce_only=True, position_side=tp_pos
-        )
+
+        # (1) 기존 TP가 있으면 선취소 → openOrders에서 사라질 때까지 잠깐 대기
+        if self.state.tp_order_id:
+            try:
+                self.client.cancel_order(self.cfg.symbol, self.state.tp_order_id)
+                self._wait_cancel(self.state.tp_order_id, timeout=2.5)
+            except Exception as e:
+                log(f"⚠️ pre-cancel TP failed: {e}")
+            finally:
+                self.state.tp_order_id = None
+
+        # TP 배치 래퍼(닫기 전용)
+        def _place_tp_once():
+            return self.client.place_limit(
+                self.cfg.symbol,
+                tp_side,
+                tp_qty,
+                tp_price,
+                reduce_only=False,
+                position_side=tp_pos,
+                tif="GTC",
+                close_position=True,       # ← 닫기 전용
+            )
+
+        # (2) 새 TP 배치 (80001이면 DCA만 정리하고 1번 더 시도)
+        try:
+            new_id = _place_tp_once()
+        except Exception as e:
+            if "80001" in str(e):
+                log("⏭️ TP 배치 보류(80001): 추적 중인 DCA 리밋을 정리하고 1회 재시도합니다.")
+                self._cancel_tracked_limits()   # 우리가 깔아둔 리밋만 정리
+                time.sleep(0.5)
+                try:
+                    new_id = _place_tp_once()
+                except Exception as e2:
+                    log(f"⚠️ TP 재시도 실패: {e2}")
+                    return
+            else:
+                # 다른 에러는 상위로
+                raise
+
         self.state.tp_order_id = str(new_id)
         self._last_tp_price = tp_price
         self._last_tp_qty   = tp_qty
         log(f"🎯 (attach) TP 확보: id={new_id}, price={tp_price}, qty={tp_qty}, side={tp_side}/{tp_pos}")
+
+
 
     # ---------- main loop ----------
     def _run(self):
@@ -441,11 +465,21 @@ class BotRunner:
                         try:
                             new_id = self.client.place_limit(
                                 self.cfg.symbol, new_side, new_qty, new_price,
-                                reduce_only=True, position_side=new_pos
+                                reduce_only=False, position_side=new_pos, close_position=True
                             )
                         except Exception as e:
                             if "80001" in str(e):
-                                continue
+                                # 혹시 TP 사이드 잔존 주문/오래된 DCA가 남아있을 수 있으므로 한 번 더 정리 후 재시도
+                                try:
+                                    self.client.cancel_open_orders(self.cfg.symbol)
+                                    time.sleep(0.5)
+                                    new_id = self.client.place_limit(
+                                        self.cfg.symbol, new_side, new_qty, new_price,
+                                        reduce_only=False, position_side=new_pos, close_position=True
+                                    )
+                                except Exception as e2:
+                                    log(f"⛔ TP 재설정 실패(재시도 불가): {e2}")
+                                    continue
                             else:
                                 raise
 

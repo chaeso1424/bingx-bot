@@ -297,31 +297,20 @@ class BingXClient:
 
 
     def _try_order(self, url: str, variants: list[dict]) -> str:
-        """
-        variants를 순차 시도. 성공하면 orderId 반환.
-        """
         last_err = None
         for body in variants:
             try:
                 j = _req_post(url, body, signed=True)
-                oid = self._extract_order_id(j)  # ✅ 응답에서 안전하게 추출
+                oid = self._extract_order_id(j)   # ✅ 항상 폭넓게 추출
                 if oid:
                     return str(oid)
-                # 그래도 못 찾았으면 한 번 더 data.order까지 직접 확인
-                try:
-                    o = (j.get("data") or {}).get("order") or {}
-                    oid = o.get("orderId") or o.get("orderID") or o.get("id")
-                except Exception:
-                    oid = None
-                if oid:
-                    return str(oid)
-
                 last_err = RuntimeError(f"missing orderId in response: {j}")
             except Exception as e:
                 last_err = e
                 log(f"⚠️ order variant failed: {e}")
                 continue
         raise last_err or RuntimeError("all order variants failed")
+
 
 
     # ----- Market / Quote -----
@@ -564,13 +553,14 @@ class BingXClient:
 
         # === 정밀도/최소수량/스텝 보정 ===
         pp, qp = self.get_symbol_filters(symbol)
+        min_qty = 0.0
         step = 1.0 if qp == 0 else 10 ** (-qp)
         try:
             spec = self.get_contract_spec(symbol)
             min_qty = float(spec.get("tradeMinQuantity") or spec.get("minQty") or spec.get("minVol") or spec.get("minTradeNum") or 0.0)
-            step    = float(spec.get("qtyStep") or spec.get("volumeStep") or spec.get("stepSize") or step)
+            step = float(spec.get("qtyStep") or spec.get("volumeStep") or spec.get("stepSize") or step)
         except Exception:
-            min_qty = 0.0
+            pass
 
         qty = max(qty, 0.0)
         qty = math.floor(qty / step) * step
@@ -578,11 +568,11 @@ class BingXClient:
         if qty < (min_qty or step):
             qty = (min_qty or step)
         if qty <= 0:
-            raise RuntimeError(f"quantity <= 0 (limit) after adjust (qp={qp}, min={min_qty}, step={step})")
+            raise RuntimeError(f"quantity <= 0 (tp/limit) after adjust (qp={qp}, min={min_qty}, step={step})")
 
         price = float(f"{float(price):.{max(pp,0)}f}")
         if price <= 0:
-            raise RuntimeError("price <= 0 (limit)")
+            raise RuntimeError("price <= 0 (tp/limit)")
 
         base = {
             "symbol": symbol,
@@ -595,21 +585,23 @@ class BingXClient:
             "timestamp": _ts(),
         }
 
+        # HEDGE: 반드시 positionSide, reduceOnly 금지
         if POSITION_MODE == "HEDGE":
-            ps = (position_side or ("LONG" if side.upper()=="BUY" else "SHORT")).upper()
-            base["positionSide"] = ps
+            base["positionSide"] = position_side or ("LONG" if side.upper()=="BUY" else "SHORT")
         else:
             if reduce_only:
                 base["reduceOnly"] = True
 
+        # ✅ 변형 시도: (1) closePosition="true"(문자열) → (2) 일반 LIMIT
         variants = []
         if close_position:
-            v = dict(base)
-            v["closePosition"] = "true"   # ← 문자열
-            variants.append(v)
-        variants.append(base)
+            v1 = base.copy(); v1["closePosition"] = "true"  # 문자열
+            v2 = base.copy(); v2["closePosition"] = True    # 불리언
+            variants.extend([v1, v2])
+        variants.append(base)  # 최후 안전
 
-        return self._try_order(url, variants)
+        return self._try_order(f"{BASE}/openApi/swap/v2/trade/order", variants)
+
 
 
 
