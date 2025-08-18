@@ -447,11 +447,13 @@ class BingXClient:
         }
 
         if POSITION_MODE == "HEDGE":
+            # ✅ 항상 넣기 (기본값 LONG/SHORT)
             ps = (position_side or ("LONG" if side.upper()=="BUY" else "SHORT")).upper()
             base["positionSide"] = ps
-        # Always set reduceOnly when requested (even in HEDGE mode)
-        if reduce_only:
-            base["reduceOnly"] = True
+            # HEDGE에서는 reduceOnly는 넣지 않는 편이 안전
+        else:
+            if reduce_only:
+                base["reduceOnly"] = True
 
         # close 포지션용 변형(필요시)
         variants = []
@@ -505,14 +507,14 @@ class BingXClient:
         if POSITION_MODE == "HEDGE":
             ps = (position_side or ("LONG" if side.upper()=="BUY" else "SHORT")).upper()
             base["positionSide"] = ps
-        # Always set reduceOnly when requested (even in HEDGE mode)
-        if reduce_only:
-            base["reduceOnly"] = True
+        else:
+            if reduce_only:
+                base["reduceOnly"] = True
 
         variants = []
         if close_position:
             v = dict(base)
-            v["closePosition"] = "true"
+            v["closePosition"] = "true"   # ← 문자열
             variants.append(v)
         variants.append(base)
 
