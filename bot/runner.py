@@ -113,9 +113,8 @@ class BotRunner:
     # bot/runner.py
 
     def _ensure_tp_for_current_position(self, pp:int, step:float, min_qty:float, side:str):
-        tp_price = tp_qty = None
-        tp_side  = "SELL" if side.upper() == "BUY" else "BUY"
-        tp_pos   = "LONG" if side.upper() == "BUY" else "SHORT"
+        tp_side = "SELL" if side.upper() == "BUY" else "BUY"
+        tp_pos  = "LONG" if side.upper() == "BUY" else "SHORT"
 
         tick = 10 ** (-pp) if pp > 0 else 0.01
         min_allowed = max(float(min_qty or 0.0), float(step or 0.0), tick)
@@ -138,7 +137,7 @@ class BotRunner:
         if tp_price <= 0 or tp_qty <= 0:
             return
 
-        # 0) 기존 TP 선취소(+반영 대기)
+        # 0) 우리가 추적하던 TP는 먼저 취소하고 반영 대기
         if self.state.tp_order_id:
             try:
                 self.client.cancel_order(self.cfg.symbol, self.state.tp_order_id)
@@ -148,42 +147,31 @@ class BotRunner:
             finally:
                 self.state.tp_order_id = None
 
-        def _place_tp_once():
+        def _place_once():
             return self.client.place_limit(
                 self.cfg.symbol, tp_side, tp_qty, tp_price,
                 reduce_only=False, position_side=tp_pos,
                 tif="GTC", close_position=True
             )
 
-        # 1) TP 배치 시도
         try:
-            new_id = _place_tp_once()
+            new_id = _place_once()
         except Exception as e:
             if "80001" in str(e):
-                log("⏭️ TP 배치 보류(80001): DCA/증가성 오더 정리 후 재시도")
-                # (a) 우리가 깔아둔 리밋
-                self._cancel_tracked_limits()
-                time.sleep(0.5)
-                # (b) 동일 심볼의 증가성 오더(BUY/SELL = tp_side에 상관없이 ‘우리 진입 side’) 정리
+                log("⏭️ TP 배치 보류(80001): 기존 TP(closePosition=true)만 정리하고 재시도")
+                # ✅ DCA(증가 주문)는 보존하고, TP류만 싹 정리
                 try:
-                    self.client.cancel_open_orders(
-                        self.cfg.symbol,
-                        side=tp_side,                 # 해당 사이드 증가 주문 위주로
-                        keep_close_position=True      # closePosition=true(기존 TP)는 유지
-                    )
+                    self.client.cancel_close_orders(self.cfg.symbol, tp_pos)
                 except Exception as e2:
-                    log(f"⚠️ cancel_open_orders 실패(무시): {e2}")
+                    log(f"⚠️ cancel_close_orders 실패(무시): {e2}")
                 time.sleep(0.5)
                 # 재시도 1회
-                try:
-                    new_id = _place_tp_once()
-                except Exception as e3:
-                    log(f"⛔ TP 재설정 실패(재시도 불가): {e3}")
-                    return
+                new_id = _place_once()
             else:
                 raise
 
         self.state.tp_order_id = str(new_id)
+        # 기준값을 확실히 기록 (모니터 루프 오판 방지)
         self._last_tp_price = tp_price
         self._last_tp_qty   = tp_qty
         log(f"🎯 (attach) TP 확보: id={new_id}, price={tp_price}, qty={tp_qty}, side={tp_side}/{tp_pos}")
@@ -364,6 +352,7 @@ class BotRunner:
                 tp_reset_cooldown = 3.0
                 last_tp_reset_ts = 0.0
                 zero_streak = 0  # 종료 판정 연속 횟수
+                tp_missing_streak = 0
 
                 while not self._stop:
                     time.sleep(POLL_SEC)
@@ -385,6 +374,29 @@ class BotRunner:
                             if oid == want:
                                 tp_alive = True
                                 break
+
+                    # 부재 누적 카운트
+                    tp_missing_streak = 0 if tp_alive else (tp_missing_streak + 1)
+
+                    need_reset_tp = False
+                    entry_now = float(self.state.position_avg_price or 0.0)
+                    if entry_now <= 0 and last_entry and last_entry > 0:
+                        entry_now = last_entry
+
+                    if not tp_alive:
+                        # ✅ 2회 연속 부재일 때만 재설정(네트워크 글리치 방지)
+                        need_reset_tp = (tp_missing_streak >= 2) and (qty_now >= min_allowed and entry_now > 0)
+                    else:
+                        if qty_now >= min_allowed and entry_now > 0:
+                            ideal_price = tp_price_from_roi(entry_now, side, float(self.cfg.tp_percent), int(self.cfg.leverage), pp)
+                            ideal_qty   = max(floor_to_step(qty_now, step), min_allowed)
+                            # 데드밴드
+                            if (last_entry is None) or (last_tp_price is None) or (last_tp_qty is None):
+                                need_reset_tp = True
+                            elif (abs(entry_now - last_entry) >= 2 * tick) or \
+                                (abs(ideal_price - last_tp_price) >= 2 * tick) or \
+                                (abs(ideal_qty - last_tp_qty) >= step):
+                                need_reset_tp = True
 
                     # ----- 종료 판정 (연속 N회 + TP 미생존 + 이중확인) -----
                     tick = 10 ** (-pp) if pp > 0 else 0.01
@@ -477,12 +489,12 @@ class BotRunner:
                                 raise
 
                         self.state.tp_order_id = str(new_id)
-                        last_entry = entry_now
-                        last_tp_price = new_price
-                        last_tp_qty = new_qty
+                        last_entry = float(pre_avg or 0.0)
+                        last_tp_price = self._last_tp_price
+                        last_tp_qty = self._last_tp_qty
                         self._last_tp_price = new_price
                         self._last_tp_qty   = new_qty
-                        last_tp_reset_ts = now_ts
+                        last_tp_reset_ts = time.time()
                         log(f"♻️ TP 재설정: id={new_id}, price={new_price}, qty={new_qty}")
 
                 # 루프 탈출: repeat면 다시 반복

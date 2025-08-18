@@ -308,35 +308,6 @@ class BingXClient:
                 log(f"⚠️ order variant failed: {e}")
                 continue
         raise last_err or RuntimeError("all order variants failed")
-    
-    def cancel_open_orders(self, symbol: str, side: str|None=None,
-                        keep_close_position: bool=True) -> int:
-        """
-        열려있는 주문을 취소.
-        - side가 주어지면 그 side(BUY/SELL)만
-        - keep_close_position=True면 closePosition=true 인 주문(TP)은 건드리지 않음
-        반환: 취소 시도한 개수
-        """
-        oo = self.open_orders(symbol)
-        count = 0
-        for o in oo:
-            try:
-                if side:
-                    s = (o.get("side") or "").upper()
-                    if s != side.upper():
-                        continue
-                if keep_close_position:
-                    cp = str(o.get("closePosition") or "").lower()
-                    if cp == "true" or cp is True:
-                        continue
-                oid = str(o.get("orderId") or o.get("orderID") or o.get("id") or "")
-                if oid:
-                    self.cancel_order(symbol, oid)
-                    count += 1
-            except Exception:
-                # 개별 실패는 무시하고 계속
-                pass
-        return count
 
 
     # ----- Market / Quote -----
@@ -654,6 +625,32 @@ class BingXClient:
         except Exception as e:
             log(f"⚠️ open_orders: {e}")
             return []
+        
+    def cancel_close_orders(self, symbol: str, position_side: str|None=None) -> int:
+        """
+        closePosition=true 인 TP류 주문만 취소.
+        position_side가 주어지면 해당 포지션(LONG/SHORT)만 대상으로 함.
+        반환: 취소 시도 개수
+        """
+        oo = self.open_orders(symbol)
+        n = 0
+        for o in oo:
+            try:
+                cp = str(o.get("closePosition") or "").lower()
+                if not (cp == "true" or cp is True):
+                    continue
+                if position_side:
+                    ps = (o.get("positionSide") or o.get("posSide") or "").upper()
+                    if ps != position_side.upper():
+                        continue
+                oid = str(o.get("orderId") or o.get("orderID") or o.get("id") or "")
+                if oid:
+                    self.cancel_order(symbol, oid)
+                    n += 1
+            except Exception:
+                pass
+        return n
+
 
     def position_info(self, symbol: str, side: str) -> tuple[float, float]:
         """
