@@ -626,30 +626,45 @@ class BingXClient:
             log(f"⚠️ open_orders: {e}")
             return []
         
-    def cancel_close_orders(self, symbol: str, position_side: str|None=None) -> int:
+    def cancel_tp_like_orders(self, symbol: str, position_side: str, entry_side: str) -> int:
         """
-        closePosition=true 인 TP류 주문만 취소.
-        position_side가 주어지면 해당 포지션(LONG/SHORT)만 대상으로 함.
+        동일 position_side에서 TP로 간주되는 오더만 취소.
+        - closePosition == "true" (or True)
+        - reduceOnly == true
+        - side 가 '진입의 반대'(롱이면 SELL, 숏이면 BUY)
         반환: 취소 시도 개수
         """
-        oo = self.open_orders(symbol)
-        n = 0
+        opposite = "SELL" if entry_side.upper() == "BUY" else "BUY"
+        count = 0
+        try:
+            oo = self.open_orders(symbol)
+        except Exception:
+            oo = []
+
         for o in oo:
             try:
-                cp = str(o.get("closePosition") or "").lower()
-                if not (cp == "true" or cp is True):
+                ps   = (o.get("positionSide") or o.get("posSide") or "").upper()
+                side = (o.get("side") or "").upper()
+                cp   = str(o.get("closePosition") or "").lower()
+                ro   = str(o.get("reduceOnly") or "").lower()
+
+                if ps != position_side.upper():
                     continue
-                if position_side:
-                    ps = (o.get("positionSide") or o.get("posSide") or "").upper()
-                    if ps != position_side.upper():
-                        continue
+
+                is_tp_like = (
+                    cp == "true" or ro == "true" or side == opposite
+                )
+                if not is_tp_like:
+                    continue
+
                 oid = str(o.get("orderId") or o.get("orderID") or o.get("id") or "")
                 if oid:
                     self.cancel_order(symbol, oid)
-                    n += 1
+                    count += 1
             except Exception:
                 pass
-        return n
+        return count
+
 
 
     def position_info(self, symbol: str, side: str) -> tuple[float, float]:

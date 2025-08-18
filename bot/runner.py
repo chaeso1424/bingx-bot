@@ -137,15 +137,23 @@ class BotRunner:
         if tp_price <= 0 or tp_qty <= 0:
             return
 
-        # 0) 우리가 추적하던 TP는 먼저 취소하고 반영 대기
+        # 0) 우리가 추적 중인 TP부터 취소 + TP-유사 주문 전부 정리
         if self.state.tp_order_id:
             try:
                 self.client.cancel_order(self.cfg.symbol, self.state.tp_order_id)
                 self._wait_cancel(self.state.tp_order_id, timeout=2.5)
             except Exception as e:
-                log(f"⚠️ pre-cancel TP failed: {e}")
+                log(f"⚠️ pre-cancel tracked TP failed: {e}")
             finally:
                 self.state.tp_order_id = None
+
+        try:
+            # ✅ 과거에 남아있을 수 있는 TP-유사 주문(반대 side/closePosition/reduceOnly)만 정리
+            n = self.client.cancel_tp_like_orders(self.cfg.symbol, tp_pos, side)
+            if n:
+                time.sleep(0.4)
+        except Exception as e:
+            log(f"⚠️ cancel_tp_like_orders 실패(무시): {e}")
 
         def _place_once():
             return self.client.place_limit(
@@ -154,24 +162,18 @@ class BotRunner:
                 tif="GTC", close_position=True
             )
 
+        # 1) 새 TP 1회 배치 (80001이면 아주 잠깐 대기 후 1회 재시도)
         try:
             new_id = _place_once()
         except Exception as e:
             if "80001" in str(e):
-                log("⏭️ TP 배치 보류(80001): 기존 TP(closePosition=true)만 정리하고 재시도")
-                # ✅ DCA(증가 주문)는 보존하고, TP류만 싹 정리
-                try:
-                    self.client.cancel_close_orders(self.cfg.symbol, tp_pos)
-                except Exception as e2:
-                    log(f"⚠️ cancel_close_orders 실패(무시): {e2}")
-                time.sleep(0.5)
-                # 재시도 1회
+                log("⏭️ TP 배치 보류(80001): 잠시 대기 후 1회 재시도")
+                time.sleep(0.6)
                 new_id = _place_once()
             else:
                 raise
 
         self.state.tp_order_id = str(new_id)
-        # 기준값을 확실히 기록 (모니터 루프 오판 방지)
         self._last_tp_price = tp_price
         self._last_tp_qty   = tp_qty
         log(f"🎯 (attach) TP 확보: id={new_id}, price={tp_price}, qty={tp_qty}, side={tp_side}/{tp_pos}")
