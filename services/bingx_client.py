@@ -223,8 +223,6 @@ class BingXClient:
         return ""
 
 
-
-
     def get_symbol_filters(self, symbol: str) -> tuple[int, int]:
         """
         /quote/contracts에서 symbol의 pricePrecision, quantityPrecision을 얻어온다.
@@ -310,7 +308,35 @@ class BingXClient:
                 log(f"⚠️ order variant failed: {e}")
                 continue
         raise last_err or RuntimeError("all order variants failed")
-
+    
+    def cancel_open_orders(self, symbol: str, side: str|None=None,
+                        keep_close_position: bool=True) -> int:
+        """
+        열려있는 주문을 취소.
+        - side가 주어지면 그 side(BUY/SELL)만
+        - keep_close_position=True면 closePosition=true 인 주문(TP)은 건드리지 않음
+        반환: 취소 시도한 개수
+        """
+        oo = self.open_orders(symbol)
+        count = 0
+        for o in oo:
+            try:
+                if side:
+                    s = (o.get("side") or "").upper()
+                    if s != side.upper():
+                        continue
+                if keep_close_position:
+                    cp = str(o.get("closePosition") or "").lower()
+                    if cp == "true" or cp is True:
+                        continue
+                oid = str(o.get("orderId") or o.get("orderID") or o.get("id") or "")
+                if oid:
+                    self.cancel_order(symbol, oid)
+                    count += 1
+            except Exception:
+                # 개별 실패는 무시하고 계속
+                pass
+        return count
 
 
     # ----- Market / Quote -----
@@ -595,12 +621,12 @@ class BingXClient:
         # ✅ 변형 시도: (1) closePosition="true"(문자열) → (2) 일반 LIMIT
         variants = []
         if close_position:
-            v1 = base.copy(); v1["closePosition"] = "true"  # 문자열
-            v2 = base.copy(); v2["closePosition"] = True    # 불리언
-            variants.extend([v1, v2])
-        variants.append(base)  # 최후 안전
+            v = dict(base)
+            v["closePosition"] = "true"   # ✅ 문자열 "true" 필수
+            variants.append(v)
+        variants.append(base)
 
-        return self._try_order(f"{BASE}/openApi/swap/v2/trade/order", variants)
+        return self._try_order(url, variants)
 
 
 
