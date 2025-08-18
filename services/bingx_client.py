@@ -5,7 +5,10 @@ import hmac
 import hashlib
 import requests
 from urllib.parse import urlencode
+from requests.adapters import HTTPAdapter
 from utils.logging import log
+from urllib3.util.retry import Retry
+
 
 import os
 # --- force IPv4 only for urllib3/requests ---
@@ -24,6 +27,31 @@ BASE = os.getenv("BINGX_BASE", "https://open-api.bingx.com")
 POSITION_MODE = os.getenv("BINGX_POSITION_MODE", "HEDGE").upper()  # HEDGE or ONEWAY
 
 
+# ---- 타임아웃/재시도 설정(환경변수) ----
+CONN_TIMEOUT = float(os.getenv("HTTP_CONN_TIMEOUT", "5"))    # 연결 타임아웃
+READ_TIMEOUT = float(os.getenv("HTTP_READ_TIMEOUT", "60"))   # 응답(읽기) 타임아웃
+HTTP_MAX_RETRIES = int(os.getenv("HTTP_MAX_RETRIES", "3"))   # 자동 재시도 횟수
+HTTP_BACKOFF = float(os.getenv("HTTP_BACKOFF", "0.5"))       # 재시도 지수 백오프 계수
+
+def _build_session() -> requests.Session:
+    s = requests.Session()
+    retry = Retry(
+        total=HTTP_MAX_RETRIES,
+        read=HTTP_MAX_RETRIES,
+        connect=HTTP_MAX_RETRIES,
+        status=HTTP_MAX_RETRIES,
+        backoff_factor=HTTP_BACKOFF,
+        status_forcelist=(429, 500, 502, 503, 504),
+        allowed_methods=frozenset(["GET", "POST", "DELETE"]),
+        raise_on_status=False,
+        respect_retry_after_header=True,
+    )
+    adapter = HTTPAdapter(max_retries=retry, pool_connections=20, pool_maxsize=50)
+    s.mount("https://", adapter)
+    s.mount("http://", adapter)
+    return s
+
+SESSION = _build_session()
 
 
 # ---------- low-level utils ----------
@@ -59,15 +87,37 @@ def _coerce_params(d: dict | None) -> dict:
             out[k] = v
     return out
 
+def _do_request(method: str, url: str, *, params=None, data=None, headers=None, signed=False, form=False):
+    timeout = (CONN_TIMEOUT, READ_TIMEOUT)
+    try:
+        if method == "GET":
+            return SESSION.get(url, params=params, headers=headers, timeout=timeout)
+        elif method == "POST":
+            if form:
+                return SESSION.post(url, data=data, headers=headers, timeout=timeout)
+            else:
+                return SESSION.post(url, json=data, headers=headers, timeout=timeout)
+        elif method == "DELETE":
+            return SESSION.delete(url, params=params, headers=headers, timeout=timeout)
+        else:
+            raise RuntimeError(f"unsupported method: {method}")
+    except requests.exceptions.ReadTimeout as e:
+        raise RuntimeError(f"ReadTimeout @{method} {url}: {e}")
+    except requests.exceptions.ConnectTimeout as e:
+        raise RuntimeError(f"ConnectTimeout @{method} {url}: {e}")
+    except requests.exceptions.ConnectionError as e:
+        # 원격 종료/일시 네트워크도 여기로 들어옴
+        raise RuntimeError(f"ConnectionError @{method} {url}: {e}")
+
+
 
 def _req_get(url: str, params: dict | None = None, signed: bool = False) -> dict:
     params = params or {}
     if signed:
-        params = _coerce_params(params)          # ← 추가
         qs = _sign(params)
-        r = requests.get(url + "?" + qs, headers=_headers(), timeout=(3, 30))
+        r = _do_request("GET", url + "?" + qs, headers=_headers(), signed=True)
     else:
-        r = requests.get(url, params=params, headers=_headers(), timeout=(3, 30))
+        r = _do_request("GET", url, params=params, headers=_headers())
     try:
         j = r.json()
     except Exception:
@@ -80,32 +130,30 @@ def _req_get(url: str, params: dict | None = None, signed: bool = False) -> dict
     return j
 
 
-def _req_delete(url: str, params: dict | None = None, signed: bool = False) -> dict:
-    params = params or {}
-    if signed:
-        params = _coerce_params(params)          # ← 추가
-        qs = _sign(params)
-        r = requests.delete(url + "?" + qs, headers=_headers(form=True), timeout=(3, 30))
-    else:
-        r = requests.delete(url, params=params, headers=_headers(form=False), timeout=(3, 30))
-    j = r.json()
-    code = str(j.get("code", "0"))
-    if code != "0":
-        raise RuntimeError(f"BingX error @DELETE {url}: {code} {j.get('msg')}")
-    return j
-
 def _req_post(url: str, body: dict | None = None, signed: bool = False) -> dict:
     body = body or {}
     if signed:
-        body = _coerce_params(body)              # ← 추가
-        payload = _sign(body)                    # querystring + signature
-        r = requests.post(url, data=payload, headers=_headers(form=True), timeout=(3, 30))
+        payload = _sign(body)  # qs + signature
+        r = _do_request("POST", url, data=payload, headers=_headers(form=True), signed=True, form=True)
     else:
-        r = requests.post(url, json=body, headers=_headers(form=False), timeout=(3, 30))
+        r = _do_request("POST", url, data=body, headers=_headers(form=False), form=False)
     j = r.json()
     code = str(j.get("code", "0"))
     if code != "0":
         raise RuntimeError(f"BingX error @POST {url}: {code} {j.get('msg')}")
+    return j
+
+def _req_delete(url: str, params: dict | None = None, signed: bool = False) -> dict:
+    params = params or {}
+    if signed:
+        qs = _sign(params)
+        r = _do_request("DELETE", url + "?" + qs, headers=_headers(form=True), signed=True)
+    else:
+        r = _do_request("DELETE", url, params=params, headers=_headers(form=False))
+    j = r.json()
+    code = str(j.get("code", "0"))
+    if code != "0":
+        raise RuntimeError(f"BingX error @DELETE {url}: {code} {j.get('msg')}")
     return j
 
 
