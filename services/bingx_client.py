@@ -23,13 +23,9 @@ API_SECRET = os.getenv("BINGX_API_SECRET", "")
 BASE = os.getenv("BINGX_BASE", "https://open-api.bingx.com")
 POSITION_MODE = os.getenv("BINGX_POSITION_MODE", "HEDGE").upper()  # HEDGE or ONEWAY
 
-
-
-
 # ---------- low-level utils ----------
 def _ts():
     return int(time.time() * 1000)
-
 
 def _headers(form: bool = False):
     if not API_KEY:
@@ -59,15 +55,16 @@ def _coerce_params(d: dict | None) -> dict:
             out[k] = v
     return out
 
-
 def _req_get(url: str, params: dict | None = None, signed: bool = False) -> dict:
     params = params or {}
     if signed:
         params = _coerce_params(params)          # ← 추가
         qs = _sign(params)
-        r = requests.get(url + "?" + qs, headers=_headers(), timeout=(3, 30))
+        # increased timeouts to mitigate read timeout errors
+        r = requests.get(url + "?" + qs, headers=_headers(), timeout=(5, 60))
     else:
-        r = requests.get(url, params=params, headers=_headers(), timeout=(3, 30))
+        # increased timeouts to mitigate read timeout errors
+        r = requests.get(url, params=params, headers=_headers(), timeout=(5, 60))
     try:
         j = r.json()
     except Exception:
@@ -79,15 +76,16 @@ def _req_get(url: str, params: dict | None = None, signed: bool = False) -> dict
         raise RuntimeError(f"BingX error @GET {url}: {code} {msg}")
     return j
 
-
 def _req_delete(url: str, params: dict | None = None, signed: bool = False) -> dict:
     params = params or {}
     if signed:
         params = _coerce_params(params)          # ← 추가
         qs = _sign(params)
-        r = requests.delete(url + "?" + qs, headers=_headers(form=True), timeout=(3, 30))
+        # increased timeouts to mitigate read timeout errors
+        r = requests.delete(url + "?" + qs, headers=_headers(form=True), timeout=(5, 60))
     else:
-        r = requests.delete(url, params=params, headers=_headers(form=False), timeout=(3, 30))
+        # increased timeouts to mitigate read timeout errors
+        r = requests.delete(url, params=params, headers=_headers(form=False), timeout=(5, 60))
     j = r.json()
     code = str(j.get("code", "0"))
     if code != "0":
@@ -99,19 +97,21 @@ def _req_post(url: str, body: dict | None = None, signed: bool = False) -> dict:
     if signed:
         body = _coerce_params(body)              # ← 추가
         payload = _sign(body)                    # querystring + signature
-        r = requests.post(url, data=payload, headers=_headers(form=True), timeout=(3, 30))
+        # increased timeouts to mitigate read timeout errors
+        r = requests.post(url, data=payload, headers=_headers(form=True), timeout=(5, 60))
     else:
-        r = requests.post(url, json=body, headers=_headers(form=False), timeout=(3, 30))
+        # increased timeouts to mitigate read timeout errors
+        r = requests.post(url, json=body, headers=_headers(form=False), timeout=(5, 60))
     j = r.json()
     code = str(j.get("code", "0"))
     if code != "0":
         raise RuntimeError(f"BingX error @POST {url}: {code} {j.get('msg')}")
     return j
 
-
-
 # ---------- high-level client ----------
 class BingXClient:
+    def __init__(self):
+        self._spec_cache = {}
 
     def get_current_leverage(self, symbol: str, side: str) -> float | None:
         """
@@ -127,7 +127,6 @@ class BingXClient:
                 ps = (p.get("positionSide") or p.get("posSide") or p.get("side") or "").upper()
                 if ps != want:
                     continue
-            # 키 이름 다양성 대비
             lev = p.get("leverage") or p.get("leverageLevel") or p.get("positionLeverage")
             if lev is not None:
                 try:
@@ -135,9 +134,6 @@ class BingXClient:
                 except:
                     pass
         return None
-
-    def __init__(self):
-        self._spec_cache = {}
 
     # (없으면 추가) 주문 응답에서 orderId 추출
     def _extract_order_id(self, resp: dict) -> str:
@@ -150,32 +146,23 @@ class BingXClient:
         """
         if not isinstance(resp, dict):
             return ""
-
-        # 최상위
         for k in ("orderId", "orderID", "id"):
             v = resp.get(k)
             if v:
                 return str(v)
-
         d = resp.get("data")
         if isinstance(d, dict):
-            # data 바로 아래
             for k in ("orderId", "orderID", "id"):
                 v = d.get(k)
                 if v:
                     return str(v)
-            # data.order 아래
             o = d.get("order")
             if isinstance(o, dict):
                 for k in ("orderId", "orderID", "id", "order_id"):
                     v = o.get(k)
                     if v:
                         return str(v)
-
         return ""
-
-
-
 
     def get_symbol_filters(self, symbol: str) -> tuple[int, int]:
         """
@@ -201,7 +188,6 @@ class BingXClient:
         fmt = f"{{:.{digits}f}}"
         return float(fmt.format(value))
 
-    
     # BingXClient 클래스 안에 추가
     def get_contract_spec(self, symbol: str) -> dict:
         """
@@ -221,7 +207,7 @@ class BingXClient:
         }
         try:
             url = f"{BASE}/openApi/swap/v2/quote/contracts"
-            j = _req_get(url)  # unsigned
+            j = _req_get(url)
             data = j.get("data", [])
             if isinstance(data, list):
                 for it in data:
@@ -246,8 +232,6 @@ class BingXClient:
             log(f"⚠️ get_contract_spec fallback: {e}")
         return spec
 
-
-
     def _try_order(self, url: str, variants: list[dict]) -> str:
         """
         variants를 순차 시도. 성공하면 orderId 반환.
@@ -256,10 +240,9 @@ class BingXClient:
         for body in variants:
             try:
                 j = _req_post(url, body, signed=True)
-                oid = self._extract_order_id(j)  # ✅ 응답에서 안전하게 추출
+                oid = self._extract_order_id(j)
                 if oid:
                     return str(oid)
-                # 그래도 못 찾았으면 한 번 더 data.order까지 직접 확인
                 try:
                     o = (j.get("data") or {}).get("order") or {}
                     oid = o.get("orderId") or o.get("orderID") or o.get("id")
@@ -267,14 +250,12 @@ class BingXClient:
                     oid = None
                 if oid:
                     return str(oid)
-
                 last_err = RuntimeError(f"missing orderId in response: {j}")
             except Exception as e:
                 last_err = e
                 log(f"⚠️ order variant failed: {e}")
                 continue
         raise last_err or RuntimeError("all order variants failed")
-
 
     # ----- Market / Quote -----
     def list_symbols(self) -> list[str]:
@@ -283,7 +264,7 @@ class BingXClient:
         """
         try:
             url = f"{BASE}/openApi/swap/v2/quote/contracts"
-            j = _req_get(url)  # unsigned
+            j = _req_get(url)
             data = j.get("data", [])
             out = []
             for it in data if isinstance(data, list) else []:
@@ -297,18 +278,14 @@ class BingXClient:
         return ["BTC-USDT", "ETH-USDT", "DOGE-USDT"]
 
     def get_last_price(self, symbol: str) -> float:
-        """
-        최신 체결가
-        """
+        """최신 체결가"""
         url = f"{BASE}/openApi/swap/v2/quote/price"
         j = _req_get(url, {"symbol": symbol})
         d = j.get("data", {})
         return float(d.get("price"))
 
     def get_mark_price(self, symbol: str) -> float:
-        """
-        마크프라이스 (없을 경우 최신가로 폴백)
-        """
+        """마크프라이스 (없을 경우 최신가로 폴백)"""
         try:
             url = f"{BASE}/openApi/swap/v2/quote/premiumIndex"
             j = _req_get(url, {"symbol": symbol})
@@ -322,9 +299,7 @@ class BingXClient:
 
     # ----- Account / Balance -----
     def get_available_usdt(self) -> float:
-        """
-        가용 USDT 마진. /user/balance 서명 GET.
-        """
+        """가용 USDT 마진. /user/balance 서명 GET."""
         url = f"{BASE}/openApi/swap/v2/user/balance"
         j = _req_get(url, {"recvWindow": 60000, "timestamp": _ts()}, signed=True)
         data = j.get("data", {})
@@ -346,31 +321,21 @@ class BingXClient:
             return 0.0
 
         if isinstance(bal, dict):
-            # 단일 자산 객체
             if bal.get("asset") in (None, "USDT"):
                 return pick_available(bal)
         elif isinstance(bal, list):
-            # 여러 자산 배열
             for b in bal:
                 if b.get("asset") == "USDT":
                     return pick_available(b)
 
-        # 최후 방어
         for k in ("availableMargin", "availableBalance", "available"):
             if k in data:
                 return float(data[k])
         raise RuntimeError(f"unexpected /user/balance payload: {j}")
-        
-    
 
     # ----- Settings (Margin mode / Leverage) -----
     def set_margin_mode(self, symbol: str, mode: str):
-        """
-        마진 모드 설정
-        - UI: CROSS / ISOLATED
-        - API: CROSSED / ISOLATED
-        일부 환경에서 marginMode 대신 marginType 키를 요구하기도 하므로 이중 시도.
-        """
+        """마진 모드 설정 - UI: CROSS / ISOLATED - API: CROSSED / ISOLATED"""
         m_primary = "CROSSED" if mode.upper().startswith("CROSS") else "ISOLATED"
         url = f"{BASE}/openApi/swap/v2/trade/marginType"
         body1 = {"symbol": symbol, "marginMode": m_primary, "recvWindow": 60000, "timestamp": _ts()}
@@ -399,16 +364,10 @@ class BingXClient:
         try:
             _req_post(url, body2, signed=True)
         except Exception as e2:
-            # 여기서도 실패해도 '진행'하도록 바꿈 (강제 종료 X)
             log(f"⚠️ set_margin_mode(alt,{url}) failed: {e2}")
 
     def set_leverage(self, symbol: str, leverage: int):
-        """
-        레버리지 설정
-        - HEDGE 모드: LONG/SHORT 각각 호출
-        - ONEWAY 모드: LONG만 시도(백엔드에서 BOTH가 필요 없는 케이스가 있음)
-        일부 환경에서 side 대신 positionSide 키로 받아들이기도 하므로 이중 시도.
-        """
+        """레버리지 설정 - HEDGE 모드: LONG/SHORT 각각 호출 - ONEWAY 모드: LONG만 시도"""
         url = f"{BASE}/openApi/swap/v2/trade/leverage"
         sides = ["LONG", "SHORT"] if POSITION_MODE == "HEDGE" else ["LONG"]
         for s in sides:
@@ -451,13 +410,12 @@ class BingXClient:
                 try:
                     _req_post(url, body2, signed=True)
                 except Exception as e2:
-                    # 실패해도 '진행'하도록 바꿈
                     log(f"⚠️ set_leverage(alt,{s},{url}) failed: {e2}")
 
     # ----- Orders / Positions -----
     def place_market(self, symbol: str, side: str, qty: float,
-                    reduce_only: bool=False, position_side: str|None=None,
-                    close_position: bool=False) -> str:
+                     reduce_only: bool=False, position_side: str|None=None,
+                     close_position: bool=False) -> str:
         import math
         url = f"{BASE}/openApi/swap/v2/trade/order"
 
@@ -482,20 +440,18 @@ class BingXClient:
         base = {
             "symbol": symbol,
             "type": "MARKET",
-            "side": side.upper(),             # BUY/SELL
+            "side": side.upper(),
             "quantity": qty,
             "recvWindow": 60000,
             "timestamp": _ts(),
         }
 
         if POSITION_MODE == "HEDGE":
-            # ✅ 항상 넣기 (기본값 LONG/SHORT)
             ps = (position_side or ("LONG" if side.upper()=="BUY" else "SHORT")).upper()
             base["positionSide"] = ps
-            # HEDGE에서는 reduceOnly는 넣지 않는 편이 안전
-        else:
-            if reduce_only:
-                base["reduceOnly"] = True
+        # Always set reduceOnly when requested (even in HEDGE mode)
+        if reduce_only:
+            base["reduceOnly"] = True
 
         # close 포지션용 변형(필요시)
         variants = []
@@ -506,7 +462,6 @@ class BingXClient:
         variants.append(base)
 
         return self._try_order(url, variants)
-
 
     def place_limit(self, symbol: str, side: str, qty: float, price: float,
                     reduce_only: bool=False, position_side: str|None=None,
@@ -550,36 +505,31 @@ class BingXClient:
         if POSITION_MODE == "HEDGE":
             ps = (position_side or ("LONG" if side.upper()=="BUY" else "SHORT")).upper()
             base["positionSide"] = ps
-        else:
-            if reduce_only:
-                base["reduceOnly"] = True
+        # Always set reduceOnly when requested (even in HEDGE mode)
+        if reduce_only:
+            base["reduceOnly"] = True
 
         variants = []
         if close_position:
             v = dict(base)
-            v["closePosition"] = "true"   # ← 문자열
+            v["closePosition"] = "true"
             variants.append(v)
         variants.append(base)
 
         return self._try_order(url, variants)
 
-
-
     def cancel_order(self, symbol: str, order_id: str) -> bool:
         url = f"{BASE}/openApi/swap/v2/trade/order"
         try:
             _req_delete(url, {"symbol": symbol, "orderId": int(order_id),
-                            "recvWindow": 60000, "timestamp": _ts()}, signed=True)
+                             "recvWindow": 60000, "timestamp": _ts()}, signed=True)
             return True
         except Exception as e:
             log(f"⚠️ cancel_order: {e}")
             return False
 
-
     def open_orders(self, symbol: str) -> list[dict]:
-        """
-        열려있는 주문 목록
-        """
+        """열려있는 주문 목록"""
         url = f"{BASE}/openApi/swap/v2/trade/openOrders"
         try:
             j = _req_get(url, {"symbol": symbol, "recvWindow": 60000, "timestamp": _ts()}, signed=True)
@@ -590,10 +540,7 @@ class BingXClient:
             return []
 
     def position_info(self, symbol: str, side: str) -> tuple[float, float]:
-        """
-        현재 포지션 (평단가, 수량). 없으면 (0.0, 0.0)
-        - 다양한 키 이름을 폭넓게 지원해서 avg가 0으로 들어오는 걸 최소화
-        """
+        """현재 포지션 (평단가, 수량). 없으면 (0.0, 0.0)"""
         url = f"{BASE}/openApi/swap/v2/user/positions"
         j = _req_get(url, {"symbol": symbol, "recvWindow": 60000, "timestamp": _ts()}, signed=True)
         arr = j.get("data", [])
@@ -613,7 +560,6 @@ class BingXClient:
         if not pos:
             return 0.0, 0.0
 
-        # 평균가 후보
         entry_keys = ["entryPrice", "avgPrice", "avgEntryPrice", "openPrice", "positionOpenPrice"]
         entry = 0.0
         for k in entry_keys:
@@ -626,7 +572,6 @@ class BingXClient:
                 except:
                     pass
 
-        # 수량 후보
         qty_keys = ["positionAmt", "positionAmount", "quantity", "positionQty", "positionSize", "amount", "qty"]
         qty = 0.0
         for k in qty_keys:
