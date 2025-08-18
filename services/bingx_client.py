@@ -5,10 +5,7 @@ import hmac
 import hashlib
 import requests
 from urllib.parse import urlencode
-from requests.adapters import HTTPAdapter
 from utils.logging import log
-from urllib3.util.retry import Retry
-
 
 import os
 # --- force IPv4 only for urllib3/requests ---
@@ -27,31 +24,6 @@ BASE = os.getenv("BINGX_BASE", "https://open-api.bingx.com")
 POSITION_MODE = os.getenv("BINGX_POSITION_MODE", "HEDGE").upper()  # HEDGE or ONEWAY
 
 
-# ---- 타임아웃/재시도 설정(환경변수) ----
-CONN_TIMEOUT = float(os.getenv("HTTP_CONN_TIMEOUT", "5"))    # 연결 타임아웃
-READ_TIMEOUT = float(os.getenv("HTTP_READ_TIMEOUT", "60"))   # 응답(읽기) 타임아웃
-HTTP_MAX_RETRIES = int(os.getenv("HTTP_MAX_RETRIES", "3"))   # 자동 재시도 횟수
-HTTP_BACKOFF = float(os.getenv("HTTP_BACKOFF", "0.5"))       # 재시도 지수 백오프 계수
-
-def _build_session() -> requests.Session:
-    s = requests.Session()
-    retry = Retry(
-        total=HTTP_MAX_RETRIES,
-        read=HTTP_MAX_RETRIES,
-        connect=HTTP_MAX_RETRIES,
-        status=HTTP_MAX_RETRIES,
-        backoff_factor=HTTP_BACKOFF,
-        status_forcelist=(429, 500, 502, 503, 504),
-        allowed_methods=frozenset(["GET", "POST", "DELETE"]),
-        raise_on_status=False,
-        respect_retry_after_header=True,
-    )
-    adapter = HTTPAdapter(max_retries=retry, pool_connections=20, pool_maxsize=50)
-    s.mount("https://", adapter)
-    s.mount("http://", adapter)
-    return s
-
-SESSION = _build_session()
 
 
 # ---------- low-level utils ----------
@@ -87,37 +59,15 @@ def _coerce_params(d: dict | None) -> dict:
             out[k] = v
     return out
 
-def _do_request(method: str, url: str, *, params=None, data=None, headers=None, signed=False, form=False):
-    timeout = (CONN_TIMEOUT, READ_TIMEOUT)
-    try:
-        if method == "GET":
-            return SESSION.get(url, params=params, headers=headers, timeout=timeout)
-        elif method == "POST":
-            if form:
-                return SESSION.post(url, data=data, headers=headers, timeout=timeout)
-            else:
-                return SESSION.post(url, json=data, headers=headers, timeout=timeout)
-        elif method == "DELETE":
-            return SESSION.delete(url, params=params, headers=headers, timeout=timeout)
-        else:
-            raise RuntimeError(f"unsupported method: {method}")
-    except requests.exceptions.ReadTimeout as e:
-        raise RuntimeError(f"ReadTimeout @{method} {url}: {e}")
-    except requests.exceptions.ConnectTimeout as e:
-        raise RuntimeError(f"ConnectTimeout @{method} {url}: {e}")
-    except requests.exceptions.ConnectionError as e:
-        # 원격 종료/일시 네트워크도 여기로 들어옴
-        raise RuntimeError(f"ConnectionError @{method} {url}: {e}")
-
-
 
 def _req_get(url: str, params: dict | None = None, signed: bool = False) -> dict:
     params = params or {}
     if signed:
+        params = _coerce_params(params)          # ← 추가
         qs = _sign(params)
-        r = _do_request("GET", url + "?" + qs, headers=_headers(), signed=True)
+        r = requests.get(url + "?" + qs, headers=_headers(), timeout=(3, 30))
     else:
-        r = _do_request("GET", url, params=params, headers=_headers())
+        r = requests.get(url, params=params, headers=_headers(), timeout=(3, 30))
     try:
         j = r.json()
     except Exception:
@@ -130,30 +80,32 @@ def _req_get(url: str, params: dict | None = None, signed: bool = False) -> dict
     return j
 
 
-def _req_post(url: str, body: dict | None = None, signed: bool = False) -> dict:
-    body = body or {}
-    if signed:
-        payload = _sign(body)  # qs + signature
-        r = _do_request("POST", url, data=payload, headers=_headers(form=True), signed=True, form=True)
-    else:
-        r = _do_request("POST", url, data=body, headers=_headers(form=False), form=False)
-    j = r.json()
-    code = str(j.get("code", "0"))
-    if code != "0":
-        raise RuntimeError(f"BingX error @POST {url}: {code} {j.get('msg')}")
-    return j
-
 def _req_delete(url: str, params: dict | None = None, signed: bool = False) -> dict:
     params = params or {}
     if signed:
+        params = _coerce_params(params)          # ← 추가
         qs = _sign(params)
-        r = _do_request("DELETE", url + "?" + qs, headers=_headers(form=True), signed=True)
+        r = requests.delete(url + "?" + qs, headers=_headers(form=True), timeout=(3, 30))
     else:
-        r = _do_request("DELETE", url, params=params, headers=_headers(form=False))
+        r = requests.delete(url, params=params, headers=_headers(form=False), timeout=(3, 30))
     j = r.json()
     code = str(j.get("code", "0"))
     if code != "0":
         raise RuntimeError(f"BingX error @DELETE {url}: {code} {j.get('msg')}")
+    return j
+
+def _req_post(url: str, body: dict | None = None, signed: bool = False) -> dict:
+    body = body or {}
+    if signed:
+        body = _coerce_params(body)              # ← 추가
+        payload = _sign(body)                    # querystring + signature
+        r = requests.post(url, data=payload, headers=_headers(form=True), timeout=(3, 30))
+    else:
+        r = requests.post(url, json=body, headers=_headers(form=False), timeout=(3, 30))
+    j = r.json()
+    code = str(j.get("code", "0"))
+    if code != "0":
+        raise RuntimeError(f"BingX error @POST {url}: {code} {j.get('msg')}")
     return j
 
 
@@ -221,6 +173,8 @@ class BingXClient:
                         return str(v)
 
         return ""
+
+
 
 
     def get_symbol_filters(self, symbol: str) -> tuple[int, int]:
@@ -295,13 +249,25 @@ class BingXClient:
 
 
     def _try_order(self, url: str, variants: list[dict]) -> str:
+        """
+        variants를 순차 시도. 성공하면 orderId 반환.
+        """
         last_err = None
         for body in variants:
             try:
                 j = _req_post(url, body, signed=True)
-                oid = self._extract_order_id(j)   # ✅ 항상 폭넓게 추출
+                oid = self._extract_order_id(j)  # ✅ 응답에서 안전하게 추출
                 if oid:
                     return str(oid)
+                # 그래도 못 찾았으면 한 번 더 data.order까지 직접 확인
+                try:
+                    o = (j.get("data") or {}).get("order") or {}
+                    oid = o.get("orderId") or o.get("orderID") or o.get("id")
+                except Exception:
+                    oid = None
+                if oid:
+                    return str(oid)
+
                 last_err = RuntimeError(f"missing orderId in response: {j}")
             except Exception as e:
                 last_err = e
@@ -550,14 +516,13 @@ class BingXClient:
 
         # === 정밀도/최소수량/스텝 보정 ===
         pp, qp = self.get_symbol_filters(symbol)
-        min_qty = 0.0
         step = 1.0 if qp == 0 else 10 ** (-qp)
         try:
             spec = self.get_contract_spec(symbol)
             min_qty = float(spec.get("tradeMinQuantity") or spec.get("minQty") or spec.get("minVol") or spec.get("minTradeNum") or 0.0)
-            step = float(spec.get("qtyStep") or spec.get("volumeStep") or spec.get("stepSize") or step)
+            step    = float(spec.get("qtyStep") or spec.get("volumeStep") or spec.get("stepSize") or step)
         except Exception:
-            pass
+            min_qty = 0.0
 
         qty = max(qty, 0.0)
         qty = math.floor(qty / step) * step
@@ -565,11 +530,11 @@ class BingXClient:
         if qty < (min_qty or step):
             qty = (min_qty or step)
         if qty <= 0:
-            raise RuntimeError(f"quantity <= 0 (tp/limit) after adjust (qp={qp}, min={min_qty}, step={step})")
+            raise RuntimeError(f"quantity <= 0 (limit) after adjust (qp={qp}, min={min_qty}, step={step})")
 
         price = float(f"{float(price):.{max(pp,0)}f}")
         if price <= 0:
-            raise RuntimeError("price <= 0 (tp/limit)")
+            raise RuntimeError("price <= 0 (limit)")
 
         base = {
             "symbol": symbol,
@@ -582,23 +547,21 @@ class BingXClient:
             "timestamp": _ts(),
         }
 
-        # HEDGE: 반드시 positionSide, reduceOnly 금지
         if POSITION_MODE == "HEDGE":
-            base["positionSide"] = position_side or ("LONG" if side.upper()=="BUY" else "SHORT")
+            ps = (position_side or ("LONG" if side.upper()=="BUY" else "SHORT")).upper()
+            base["positionSide"] = ps
         else:
             if reduce_only:
                 base["reduceOnly"] = True
 
-        # ✅ 변형 시도: (1) closePosition="true"(문자열) → (2) 일반 LIMIT
         variants = []
         if close_position:
             v = dict(base)
-            v["closePosition"] = "true"   # ✅ 문자열 "true" 필수
+            v["closePosition"] = "true"   # ← 문자열
             variants.append(v)
         variants.append(base)
 
         return self._try_order(url, variants)
-
 
 
 
@@ -625,47 +588,6 @@ class BingXClient:
         except Exception as e:
             log(f"⚠️ open_orders: {e}")
             return []
-        
-    def cancel_tp_like_orders(self, symbol: str, position_side: str, entry_side: str) -> int:
-        """
-        동일 position_side에서 TP로 간주되는 오더만 취소.
-        - closePosition == "true" (or True)
-        - reduceOnly == true
-        - side 가 '진입의 반대'(롱이면 SELL, 숏이면 BUY)
-        반환: 취소 시도 개수
-        """
-        opposite = "SELL" if entry_side.upper() == "BUY" else "BUY"
-        count = 0
-        try:
-            oo = self.open_orders(symbol)
-        except Exception:
-            oo = []
-
-        for o in oo:
-            try:
-                ps   = (o.get("positionSide") or o.get("posSide") or "").upper()
-                side = (o.get("side") or "").upper()
-                cp   = str(o.get("closePosition") or "").lower()
-                ro   = str(o.get("reduceOnly") or "").lower()
-
-                if ps != position_side.upper():
-                    continue
-
-                is_tp_like = (
-                    cp == "true" or ro == "true" or side == opposite
-                )
-                if not is_tp_like:
-                    continue
-
-                oid = str(o.get("orderId") or o.get("orderID") or o.get("id") or "")
-                if oid:
-                    self.cancel_order(symbol, oid)
-                    count += 1
-            except Exception:
-                pass
-        return count
-
-
 
     def position_info(self, symbol: str, side: str) -> tuple[float, float]:
         """
