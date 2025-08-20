@@ -6,7 +6,6 @@ from utils.mathx import tp_price_from_roi, floor_to_step
 from models.config import BotConfig
 from models.state import BotState
 from services.bingx_client import BingXClient
-import random
 import os
 
 # ===== 운영 파라미터 =====
@@ -417,10 +416,6 @@ class BotRunner:
                 tp_reset_cooldown = 3.0
                 last_tp_reset_ts = 0.0
                 zero_streak = 0  # 종료 판정 연속 횟수
-
-                tick_idx = 0
-                net_err_streak = 0
-
                 while not self._stop:
                     time.sleep(POLL_SEC)
                     self._refresh_position()
@@ -439,7 +434,6 @@ class BotRunner:
                             if oid == want:
                                 tp_alive = True
                                 break
-
                     # ----- 종료 판정 (연속 N회 + TP 미생존 + 이중확인) -----
                     tick = 10 ** (-pp) if pp > 0 else 0.01
                     min_allowed = max(float(min_qty or 0.0), float(step or 0.0), tick)
@@ -456,8 +450,9 @@ class BotRunner:
                         except Exception:
                             chk_avg, chk_qty = 0.0, 0.0
                         if float(chk_qty or 0.0) < zero_eps:
-                            self._cancel_tracked_limits()
-
+                            # 포지션이 완전히 청산된 경우 DCA 리밋을 정리한다. attach 모드에서는 건드리지 않음.
+                            if not self._attach_mode:
+                                self._cancel_tracked_limits()
                             if self.state.tp_order_id:
                                 try:
                                     self.client.cancel_order(self.cfg.symbol, self.state.tp_order_id)
