@@ -6,13 +6,14 @@ from utils.mathx import tp_price_from_roi, floor_to_step
 from models.config import BotConfig
 from models.state import BotState
 from services.bingx_client import BingXClient
+import random
 import os
 
 # ===== 운영 파라미터 =====
 RESTART_DELAY_SEC = int(os.getenv("RESTART_DELAY_SEC", "60"))   # TP 후 다음 사이클 대기
 CLOSE_ZERO_STREAK = int(os.getenv("CLOSE_ZERO_STREAK", "3"))    # 종료 판정에 필요한 연속 0회수
 ZERO_EPS_FACTOR = float(os.getenv("ZERO_EPS_FACTOR", "0.5"))  # 0 판정 여유(최소단위의 50%)
-POLL_SEC = 1.5
+POLL_SEC = 2.5
 
 
 class BotRunner:
@@ -416,15 +417,50 @@ class BotRunner:
                 tp_reset_cooldown = 3.0
                 last_tp_reset_ts = 0.0
                 zero_streak = 0  # 종료 판정 연속 횟수
+
+                tick_idx = 0
+                net_err_streak = 0
+
                 while not self._stop:
-                    time.sleep(POLL_SEC)
+                    time.sleep(POLL_SEC + random.uniform(0.0, 0.4))
                     self._refresh_position()
-                    # 오픈오더 조회
+
                     try:
-                        open_orders = self.client.open_orders(self.cfg.symbol)
+                        self._refresh_position()
+                        net_err_streak = 0
                     except Exception as e:
-                        log(f"⚠️ 오픈오더 조회 실패: {e}")
-                        open_orders = []
+                        net_err_streak += 1
+                        log(f"⚠️ position refresh 실패[{net_err_streak}]: {e}")
+                        if net_err_streak >= 3:
+                            log("⛔ 네트워크 오류 연속 3회 → 소프트 재시작(attach 모드로 복구)")
+                            break
+                        continue
+
+                    # 오픈오더 조회
+                    need_fetch_open = (tick_idx % 3 == 0)
+                    if need_fetch_open:
+                        try:
+                            open_orders = self.client.open_orders(self.cfg.symbol)
+                            net_err_streak = 0
+                        except Exception as e:
+                            net_err_streak += 1
+                            log(f"⚠️ 오픈오더 조회 실패[{net_err_streak}]: {e}")
+                            if "100421" in str(e):
+                                log("⏱️ 타임스탬프 오류 → 다음 틱에 재시도 (recvWindow/서명시간 동기화)")
+                            if net_err_streak >= 3:
+                                log("⛔ 네트워크 오류 연속 3회 → 소프트 재시작(attach 모드로 복구)")
+                                break
+                            # 이번 틱은 오더목록 없이 진행
+                            open_orders = []
+                    else:
+                        # 이전 값 재사용(필요한 곳만 TP 생존 확인용으로 사용)
+                        try:
+                            open_orders
+                        except NameError:
+                            open_orders = []
+
+                    tick_idx += 1
+
                     # TP 생존 확인
                     tp_alive = False
                     if self.state.tp_order_id:
@@ -434,6 +470,7 @@ class BotRunner:
                             if oid == want:
                                 tp_alive = True
                                 break
+                            
                     # ----- 종료 판정 (연속 N회 + TP 미생존 + 이중확인) -----
                     tick = 10 ** (-pp) if pp > 0 else 0.01
                     min_allowed = max(float(min_qty or 0.0), float(step or 0.0), tick)
