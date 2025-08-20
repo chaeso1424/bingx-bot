@@ -6,13 +6,14 @@ from utils.mathx import tp_price_from_roi, floor_to_step
 from models.config import BotConfig
 from models.state import BotState
 from services.bingx_client import BingXClient
+import random
 import os
 
 # ===== 운영 파라미터 =====
 RESTART_DELAY_SEC = int(os.getenv("RESTART_DELAY_SEC", "60"))   # TP 후 다음 사이클 대기
 CLOSE_ZERO_STREAK = int(os.getenv("CLOSE_ZERO_STREAK", "3"))    # 종료 판정에 필요한 연속 0회수
 ZERO_EPS_FACTOR = float(os.getenv("ZERO_EPS_FACTOR", "0.5"))  # 0 판정 여유(최소단위의 50%)
-POLL_SEC = 2.5
+POLL_SEC = 1.5
 
 
 class BotRunner:
@@ -438,6 +439,7 @@ class BotRunner:
                             if oid == want:
                                 tp_alive = True
                                 break
+
                     # ----- 종료 판정 (연속 N회 + TP 미생존 + 이중확인) -----
                     tick = 10 ** (-pp) if pp > 0 else 0.01
                     min_allowed = max(float(min_qty or 0.0), float(step or 0.0), tick)

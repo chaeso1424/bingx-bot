@@ -6,7 +6,7 @@ import hashlib
 import requests
 from urllib.parse import urlencode
 from utils.logging import log
-import requests, time
+
 import os
 # --- force IPv4 only for urllib3/requests ---
 import socket
@@ -55,29 +55,16 @@ def _coerce_params(d: dict | None) -> dict:
             out[k] = v
     return out
 
-def _with_retry(req_fn, *args, **kwargs):
-    max_try = 3
-    delay = 0.6
-    for i in range(max_try):
-        try:
-            return req_fn(*args, **kwargs)
-        except (requests.exceptions.ReadTimeout,
-                requests.exceptions.ConnectionError) as e:
-            if i == max_try - 1:
-                raise
-            time.sleep(delay)
-            delay *= 2.0
-
 def _req_get(url: str, params: dict | None = None, signed: bool = False) -> dict:
     params = params or {}
     if signed:
         params = _coerce_params(params)          # ← 추가
         qs = _sign(params)
         # increased timeouts to mitigate read timeout errors
-        r = _with_retry(requests.get, url + "?" + qs, headers=_headers(), timeout=(5, 60))
+        r = requests.get(url + "?" + qs, headers=_headers(), timeout=(5, 60))
     else:
         # increased timeouts to mitigate read timeout errors
-        r = _with_retry(requests.get, url, params=params, headers=_headers(), timeout=(5, 60))
+        r = requests.get(url, params=params, headers=_headers(), timeout=(5, 60))
     try:
         j = r.json()
     except Exception:
@@ -95,10 +82,10 @@ def _req_delete(url: str, params: dict | None = None, signed: bool = False) -> d
         params = _coerce_params(params)          # ← 추가
         qs = _sign(params)
         # increased timeouts to mitigate read timeout errors
-        r = _with_retry(requests.delete, url + "?" + qs, headers=_headers(form=True), timeout=(5, 60))
+        r = requests.delete(url + "?" + qs, headers=_headers(form=True), timeout=(5, 60))
     else:
         # increased timeouts to mitigate read timeout errors
-        r = _with_retry(requests.delete,url, params=params, headers=_headers(form=False), timeout=(5, 60))
+        r = requests.delete(url, params=params, headers=_headers(form=False), timeout=(5, 60))
     j = r.json()
     code = str(j.get("code", "0"))
     if code != "0":
@@ -111,10 +98,10 @@ def _req_post(url: str, body: dict | None = None, signed: bool = False) -> dict:
         body = _coerce_params(body)              # ← 추가
         payload = _sign(body)                    # querystring + signature
         # increased timeouts to mitigate read timeout errors
-        r = _with_retry(requests.post, url, data=payload, headers=_headers(form=True), timeout=(5, 60))
+        r = requests.post(url, data=payload, headers=_headers(form=True), timeout=(5, 60))
     else:
         # increased timeouts to mitigate read timeout errors
-        r = _with_retry(requests.post, url, json=body, headers=_headers(form=False), timeout=(5, 60))
+        r = requests.post(url, json=body, headers=_headers(form=False), timeout=(5, 60))
     j = r.json()
     code = str(j.get("code", "0"))
     if code != "0":
@@ -543,19 +530,16 @@ class BingXClient:
             log(f"⚠️ cancel_order: {e}")
             return False
 
-    def open_orders(self, symbol: str | None = None) -> list[dict]:
+    def open_orders(self, symbol: str) -> list[dict]:
+        """열려있는 주문 목록"""
         url = f"{BASE}/openApi/swap/v2/trade/openOrders"
-        params = {
-            "recvWindow": 60000,       
-            "timestamp": _ts(),        
-        }
-        if symbol:
-            params["symbol"] = symbol
-        j = _req_get(url, params, signed=True)
-        arr = j.get("data") or j.get("orders") or []
-        return arr if isinstance(arr, list) else []
-
-
+        try:
+            j = _req_get(url, {"symbol": symbol, "recvWindow": 60000, "timestamp": _ts()}, signed=True)
+            data = j.get("data", [])
+            return data if isinstance(data, list) else data.get("orders", [])
+        except Exception as e:
+            log(f"⚠️ open_orders: {e}")
+            return []
 
     def position_info(self, symbol: str, side: str) -> tuple[float, float]:
         """현재 포지션 (평단가, 수량). 없으면 (0.0, 0.0)"""
