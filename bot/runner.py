@@ -6,7 +6,6 @@ from utils.mathx import tp_price_from_roi, floor_to_step
 from models.config import BotConfig
 from models.state import BotState
 from services.bingx_client import BingXClient
-import random
 import os
 
 # ===== 운영 파라미터 =====
@@ -422,27 +421,14 @@ class BotRunner:
                 net_err_streak = 0
 
                 while not self._stop:
-                    time.sleep(POLL_SEC + random.uniform(0.0, 0.4))
+                    time.sleep(POLL_SEC)
                     self._refresh_position()
-
-                    try:
-                        self._refresh_position()
-                        net_err_streak = 0
-                    except Exception as e:
-                        net_err_streak += 1
-                        log(f"⚠️ position refresh 실패[{net_err_streak}]: {e}")
-                        if net_err_streak >= 3:
-                            log("⛔ 네트워크 오류 연속 3회 → 소프트 재시작(attach 모드로 복구)")
-                            break
-                        continue
-                    
                     # 오픈오더 조회
                     try:
                         open_orders = self.client.open_orders(self.cfg.symbol)
                     except Exception as e:
                         log(f"⚠️ 오픈오더 조회 실패: {e}")
                         open_orders = []
-                        
                     # TP 생존 확인
                     tp_alive = False
                     if self.state.tp_order_id:
