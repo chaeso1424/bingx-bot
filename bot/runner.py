@@ -450,9 +450,8 @@ class BotRunner:
                         except Exception:
                             chk_avg, chk_qty = 0.0, 0.0
                         if float(chk_qty or 0.0) < zero_eps:
-                            # 포지션이 완전히 청산된 경우 DCA 리밋을 정리한다. attach 모드에서는 건드리지 않음.
-                            if not self._attach_mode:
-                                self._cancel_tracked_limits()
+                            self._cancel_tracked_limits()
+
                             if self.state.tp_order_id:
                                 try:
                                     self.client.cancel_order(self.cfg.symbol, self.state.tp_order_id)
