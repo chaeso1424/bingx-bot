@@ -435,32 +435,14 @@ class BotRunner:
                             log("⛔ 네트워크 오류 연속 3회 → 소프트 재시작(attach 모드로 복구)")
                             break
                         continue
-
+                    
                     # 오픈오더 조회
-                    need_fetch_open = (tick_idx % 3 == 0)
-                    if need_fetch_open:
-                        try:
-                            open_orders = self.client.open_orders(self.cfg.symbol)
-                            net_err_streak = 0
-                        except Exception as e:
-                            net_err_streak += 1
-                            log(f"⚠️ 오픈오더 조회 실패[{net_err_streak}]: {e}")
-                            if "100421" in str(e):
-                                log("⏱️ 타임스탬프 오류 → 다음 틱에 재시도 (recvWindow/서명시간 동기화)")
-                            if net_err_streak >= 3:
-                                log("⛔ 네트워크 오류 연속 3회 → 소프트 재시작(attach 모드로 복구)")
-                                break
-                            # 이번 틱은 오더목록 없이 진행
-                            open_orders = []
-                    else:
-                        # 이전 값 재사용(필요한 곳만 TP 생존 확인용으로 사용)
-                        try:
-                            open_orders
-                        except NameError:
-                            open_orders = []
-
-                    tick_idx += 1
-
+                    try:
+                        open_orders = self.client.open_orders(self.cfg.symbol)
+                    except Exception as e:
+                        log(f"⚠️ 오픈오더 조회 실패: {e}")
+                        open_orders = []
+                        
                     # TP 생존 확인
                     tp_alive = False
                     if self.state.tp_order_id:
@@ -470,7 +452,6 @@ class BotRunner:
                             if oid == want:
                                 tp_alive = True
                                 break
-                            
                     # ----- 종료 판정 (연속 N회 + TP 미생존 + 이중확인) -----
                     tick = 10 ** (-pp) if pp > 0 else 0.01
                     min_allowed = max(float(min_qty or 0.0), float(step or 0.0), tick)
