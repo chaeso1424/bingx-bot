@@ -192,8 +192,9 @@ class BotRunner:
                 position_side=tp_pos,
             )
         except Exception as e:
-            # 코드 80001(가용 잔액 부족) 등에 대해선 TP 생략만 한다.
-            if "80001" in str(e):
+            msg = str(e)
+            # 잔액 부족(80001)이나 Read timeout 발생 시 TP는 생략하고 attach 모드에서 다시 시도
+            if ("80001" in msg) or ("timed out" in msg.lower()):
                 log(f"⚠️ TP 확보 실패: {e}")
                 new_id = None
             else:
@@ -308,10 +309,15 @@ class BotRunner:
                     try:
                         oid = self.client.place_market(self.cfg.symbol, side, qty)
                     except Exception as e:
-                        if "80001" in str(e):
-                            # 가용 잔액 부족 등으로 시장가 실패 시 즉시 종료
+                        msg = str(e)
+                        if "80001" in msg:
+                            # 잔액부족이면 이번 사이클은 종료(다음 반복에서 예산 다시 체크)
                             log(f"❌ 시장가 진입 실패: {e}")
                             break
+                        elif "timed out" in msg.lower():
+                            # Read Timeout류 → 봇 종료하지 말고 다음 사이클로 넘어가 attach 판단
+                            log(f"⚠️ 시장가 주문 타임아웃: {e} → attach 모드로 재시도")
+                            continue
                         else:
                             raise
                     if not oid:
@@ -341,9 +347,14 @@ class BotRunner:
                                 position_side=entry_pos_side,
                             )
                         except Exception as e:
-                            if "80001" in str(e):
-                                # 가용 잔액 부족으로 추가 리밋 주문 실패 시 더 이상 리밋 깔지 않음
+                            msg = str(e)
+                            if "80001" in msg:
+                                # 잔액부족 → 남은 리밋은 더 깔지 않고 DCA 루프 종료
                                 log(f"⚠️ {i}차 리밋 주문 실패: {e}")
+                                break
+                            elif "timed out" in msg.lower():
+                                # 타임아웃 → 남은 리밋은 생략하고 다음 사이클에서 다시 시도
+                                log(f"⚠️ {i}차 리밋 타임아웃: {e} → 남은 리밋 생략")
                                 break
                             else:
                                 raise
@@ -450,9 +461,8 @@ class BotRunner:
                         except Exception:
                             chk_avg, chk_qty = 0.0, 0.0
                         if float(chk_qty or 0.0) < zero_eps:
-                            # 포지션이 완전히 청산된 경우 DCA 리밋을 정리한다. attach 모드에서는 건드리지 않음.
-                            if not self._attach_mode:
-                                self._cancel_tracked_limits()
+                            # 포지션 완전 청산 → DCA/TP 전부 정리
+                            self._cancel_tracked_limits()
                             if self.state.tp_order_id:
                                 try:
                                     self.client.cancel_order(self.cfg.symbol, self.state.tp_order_id)
@@ -508,7 +518,9 @@ class BotRunner:
                                 position_side=new_pos,
                             )
                         except Exception as e:
-                            if "80001" in str(e):
+                            msg = str(e)
+                            if ("80001" in msg) or ("timed out" in msg.lower()):
+                                # 잔액부족/타임아웃이면 이번 재설정만 건너뜀
                                 continue
                             else:
                                 raise
@@ -526,17 +538,16 @@ class BotRunner:
                 if not self.state.repeat_mode:
                     break
                 else:
-                    # 남은 오더 안전정리. attach 모드일 땐 기존 DCA 리밋을 보존한다.
-                    if not self._attach_mode:
-                        self._cancel_tracked_limits()
+                    # 남은 오더 안전정리(attach 여부와 무관하게 전부 정리)
+                    self._cancel_tracked_limits()
                     if self.state.tp_order_id:
                         try:
                             self.client.cancel_order(self.cfg.symbol, self.state.tp_order_id)
                         except Exception:
                             pass
                         self.state.tp_order_id = None
-                    if not self._attach_mode:
-                        self.state.reset_orders()
+                    self.state.reset_orders()
+
                     delay = max(0, RESTART_DELAY_SEC)
                     if delay > 0:
                         log(f" 반복 모드 → {delay}초 대기 후 재시작")
