@@ -1,18 +1,20 @@
 # runner.py
 import threading
 import time
+import random
 from utils.logging import log
 from utils.mathx import tp_price_from_roi, floor_to_step
 from models.config import BotConfig
 from models.state import BotState
 from services.bingx_client import BingXClient
+from requests.exceptions import ReadTimeout, ConnectionError
 import os
 
 # ===== 운영 파라미터 =====
 RESTART_DELAY_SEC = int(os.getenv("RESTART_DELAY_SEC", "60"))   # TP 후 다음 사이클 대기
 CLOSE_ZERO_STREAK = int(os.getenv("CLOSE_ZERO_STREAK", "3"))    # 종료 판정에 필요한 연속 0회수
 ZERO_EPS_FACTOR = float(os.getenv("ZERO_EPS_FACTOR", "0.5"))  # 0 판정 여유(최소단위의 50%)
-POLL_SEC = 1.5
+POLL_SEC = 2.5
 
 
 class BotRunner:
@@ -416,15 +418,51 @@ class BotRunner:
                 tp_reset_cooldown = 3.0
                 last_tp_reset_ts = 0.0
                 zero_streak = 0  # 종료 판정 연속 횟수
+
+                tick_idx = 0
+                net_err_streak = 0
+
                 while not self._stop:
-                    time.sleep(POLL_SEC)
+                    time.sleep(POLL_SEC + random.uniform(0.0, 0.4))
                     self._refresh_position()
-                    # 오픈오더 조회
+
+                    # 포지션은 매틱 조회
                     try:
-                        open_orders = self.client.open_orders(self.cfg.symbol)
+                        self._refresh_position()
+                        net_err_streak = 0
                     except Exception as e:
-                        log(f"⚠️ 오픈오더 조회 실패: {e}")
-                        open_orders = []
+                        net_err_streak += 1
+                        log(f"⚠️ position refresh 실패[{net_err_streak}]: {e}")
+                        if net_err_streak >= 3:
+                            log("⛔ 네트워크 오류 연속 3회 → 소프트 재시작(attach 모드로 복구)")
+                            break
+                        continue
+                    
+                    # open_orders는 2~3틱에 한 번만 조회
+                    need_fetch_open = (tick_idx % 3 == 0)
+                    if need_fetch_open:
+                        try:
+                            open_orders = self.client.open_orders(self.cfg.symbol)
+                            net_err_streak = 0
+                        except Exception as e:
+                            net_err_streak += 1
+                            log(f"⚠️ 오픈오더 조회 실패[{net_err_streak}]: {e}")
+                            if "100421" in str(e):
+                                log("⏱️ 타임스탬프 오류 → 다음 틱에 재시도 (recvWindow/서명시간 동기화)")
+                            if net_err_streak >= 3:
+                                log("⛔ 네트워크 오류 연속 3회 → 소프트 재시작(attach 모드로 복구)")
+                                break
+                            # 이번 틱은 오더목록 없이 진행
+                            open_orders = []
+                    else:
+                        # 이전 값 재사용(필요한 곳만 TP 생존 확인용으로 사용)
+                        try:
+                            open_orders
+                        except NameError:
+                            open_orders = []
+
+                    tick_idx += 1
+
                     # TP 생존 확인
                     tp_alive = False
                     if self.state.tp_order_id:
@@ -434,6 +472,7 @@ class BotRunner:
                             if oid == want:
                                 tp_alive = True
                                 break
+
                     # ----- 종료 판정 (연속 N회 + TP 미생존 + 이중확인) -----
                     tick = 10 ** (-pp) if pp > 0 else 0.01
                     min_allowed = max(float(min_qty or 0.0), float(step or 0.0), tick)
@@ -450,19 +489,23 @@ class BotRunner:
                         except Exception:
                             chk_avg, chk_qty = 0.0, 0.0
                         if float(chk_qty or 0.0) < zero_eps:
-                            # 포지션이 완전히 청산된 경우 DCA 리밋을 정리한다. attach 모드에서는 건드리지 않음.
-                            if not self._attach_mode:
-                                self._cancel_tracked_limits()
+                            # ✅ 포지션이 완전히 청산된 경우: attach 모드 상관없이 전부 정리
+                            # 1) 트래킹한 DCA 리밋 정리
+                            self._cancel_tracked_limits()
+
+                            # 2) TP 정리
                             if self.state.tp_order_id:
                                 try:
                                     self.client.cancel_order(self.cfg.symbol, self.state.tp_order_id)
                                 except Exception:
                                     pass
                                 self.state.tp_order_id = None
+
                             log("✅ 포지션 종료 확정(연속검증+이중확인) → 대기")
                             break
                         else:
                             zero_streak = 0
+
                     # ----- TP 재설정(데드밴드 + 쿨다운) -----
                     need_reset_tp = False
                     entry_now = float(self.state.position_avg_price or 0.0)
@@ -508,7 +551,8 @@ class BotRunner:
                                 position_side=new_pos,
                             )
                         except Exception as e:
-                            if "80001" in str(e):
+                            # 가용잔고 부족/일시 네트워크 문제는 재시도 기회 남김
+                            if "80001" in str(e) or isinstance(e, (ReadTimeout, ConnectionError)):
                                 continue
                             else:
                                 raise
