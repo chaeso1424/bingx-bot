@@ -131,24 +131,23 @@ class BotRunner:
         """
         tick = 10 ** (-pp) if pp > 0 else 0.01
         min_allowed = max(float(min_qty or 0.0), float(step or 0.0), tick)
+        zero_eps = max(float(step or 1.0), tick)
 
         qty_now = float(self.state.position_qty or 0.0)
         if qty_now < min_allowed:
             return
 
-        # ✅ 기존 TP 먼저 정리 (attach 진입 시 중복·충돌 방지)
+        # ① 기존 TP 먼저 정리 (중복/충돌 방지)
         if self.state.tp_order_id:
             try:
                 self.client.cancel_order(self.cfg.symbol, self.state.tp_order_id)
                 try:
-                    # 있으면 잠깐 대기 (있는 메서드면 사용, 없으면 무시)
                     self._wait_cancel(self.state.tp_order_id, timeout=2.5)
                 except Exception:
                     pass
             except Exception:
                 pass
             self.state.tp_order_id = None
-            # (선택) 캐시 초기화
             self._last_tp_price = None
             self._last_tp_qty = None
 
@@ -166,33 +165,8 @@ class BotRunner:
         if not (tp_price and tp_price > 0):
             return
 
-        price_changed = True
-        qty_changed = True
-        if self.state.tp_order_id:
-            try:
-                oo = self.client.open_orders(self.cfg.symbol)
-                want = str(self.state.tp_order_id)
-                alive = any(
-                    str(o.get("orderId") or o.get("orderID") or o.get("id") or "") == want
-                    for o in oo
-                )
-                if alive:
-                    last_price = self._last_tp_price
-                    last_qty = self._last_tp_qty
-                    if (last_price is not None) and (abs(tp_price - last_price) < 2 * tick):
-                        price_changed = False
-                    if (last_qty is not None) and (abs(tp_qty - last_qty) < float(step or 1.0)):
-                        qty_changed = False
-                    if not (price_changed or qty_changed):
-                        return
-                    else:
-                        try:
-                            self.client.cancel_order(self.cfg.symbol, self.state.tp_order_id)
-                        except Exception:
-                            pass
-                        self.state.tp_order_id = None
-            except Exception:
-                pass
+        # ② 포지션 수량과 TP 수량이 사실상 같으면 closePosition 변형도 시도
+        full_close = abs(tp_qty - qty_now) < zero_eps
 
         tp_side = "SELL" if side.upper() == "BUY" else "BUY"
         tp_pos = "LONG" if side.upper() == "BUY" else "SHORT"
@@ -205,6 +179,7 @@ class BotRunner:
                 tp_price,
                 reduce_only=True,
                 position_side=tp_pos,
+                close_position=full_close,   # ★ 동일수량이면 closePosition 변형 우선 시도(variants에 추가됨)
             )
         except Exception as e:
             msg = str(e)
@@ -219,6 +194,7 @@ class BotRunner:
             self._last_tp_price = tp_price
             self._last_tp_qty = tp_qty
             log(f" (attach) TP 확보: id={new_id}, price={tp_price}, qty={tp_qty}, side={tp_side}/{tp_pos}")
+
 
 
     # ---------- main loop ----------
