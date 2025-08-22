@@ -122,8 +122,8 @@ class BotRunner:
         self.state.open_limit_ids.clear()
 
     def _ensure_tp_for_current_position(
-            self, pp: int, step: float, min_qty: float, side: str
-        ) -> None:
+        self, pp: int, step: float, min_qty: float, side: str
+    ) -> None:
         """
         현재 보유 포지션(평단/수량)을 기준으로 TP 주문을 확보/재설정한다.
         - DCA/시장가 진입은 하지 않음
@@ -131,7 +131,6 @@ class BotRunner:
         """
         tick = 10 ** (-pp) if pp > 0 else 0.01
         min_allowed = max(float(min_qty or 0.0), float(step or 0.0), tick)
-        zero_eps = max(float(step or 1.0), tick)
 
         qty_now = float(self.state.position_qty or 0.0)
         if qty_now < min_allowed:
@@ -151,102 +150,60 @@ class BotRunner:
         if not (tp_price and tp_price > 0):
             return
 
-        # ② 포지션 수량과 TP 수량이 사실상 같으면 closePosition 변형도 시도
-        #    - 비교는 '스텝 보정 수량' 기준으로 엄격하게
-        #    - HEDGE 모드에선 reduceOnly 쓰지 않음(거부/무시 사례 방지)
-        norm = lambda x: floor_to_step(float(x), float(step or 1.0))
-        qty_now_norm = norm(qty_now)
-        tp_qty_norm  = norm(tp_qty)
-
-        # 동일/사실상 동일 판정 epsilon
-        zero_eps = max(float(step or 1.0), tick)
-
-        full_close = abs(tp_qty_norm - qty_now_norm) < zero_eps
+        price_changed = True
+        qty_changed = True
+        if self.state.tp_order_id:
+            try:
+                oo = self.client.open_orders(self.cfg.symbol)
+                want = str(self.state.tp_order_id)
+                alive = any(
+                    str(o.get("orderId") or o.get("orderID") or o.get("id") or "")
+                    == want
+                    for o in oo
+                )
+                if alive:
+                    last_price = self._last_tp_price
+                    last_qty = self._last_tp_qty
+                    if (last_price is not None) and (abs(tp_price - last_price) < 2 * tick):
+                        price_changed = False
+                    if (last_qty is not None) and (abs(tp_qty - last_qty) < float(step or 1.0)):
+                        qty_changed = False
+                    if not (price_changed or qty_changed):
+                        return
+                    else:
+                        try:
+                            self.client.cancel_order(self.cfg.symbol, self.state.tp_order_id)
+                        except Exception:
+                            pass
+                        self.state.tp_order_id = None
+            except Exception:
+                pass
 
         tp_side = "SELL" if side.upper() == "BUY" else "BUY"
-        tp_pos  = "LONG" if side.upper() == "BUY" else "SHORT"
-
-        # A) 먼저 '이미 있는 TP'가 동일 side/positionSide & 거의 같은 가격/수량이면 그걸 채택(중복 주문 방지)
-        try:
-            oo = self.client.open_orders(self.cfg.symbol)
-        except Exception:
-            oo = []
-
-        adopted = False
-        if oo:
-            for o in oo:
-                try:
-                    oside = (o.get("side") or "").upper()
-                    opos  = (o.get("positionSide") or o.get("posSide") or "").upper()
-                    oprice = o.get("price") or o.get("origPrice") or o.get("stopPrice")
-                    op = float(oprice) if oprice not in (None, "") else None
-                    oqty = o.get("origQty") or o.get("quantity") or o.get("origQuantity") or o.get("qty")
-                    oq = norm(oqty) if oqty not in (None, "") else None
-                    # 가격/수량이 거의 같고 방향/포지션이 일치하면 그 TP를 그대로 사용
-                    if oside == tp_side and (opos == tp_pos or (tp_pos and opos == "")) \
-                    and (op is not None) and (oq is not None) \
-                    and abs(op - tp_price) < 2 * tick and abs(oq - tp_qty_norm) < zero_eps:
-                        self.state.tp_order_id = str(o.get("orderId") or o.get("orderID") or o.get("id"))
-                        self._last_tp_price = op
-                        self._last_tp_qty   = oq
-                        log(f" (attach) 기존 TP 연결: id={self.state.tp_order_id}, price={op}, qty={oq}")
-                        adopted = True
-                        break
-                except Exception:
-                    continue
-        if adopted:
-            return
-
-        # B) 새 TP 배치. HEDGE에선 reduceOnly 사용 안 함, ONEWAY만 reduceOnly 적용
-        use_reduce_only = (getattr(self.client, "POSITION_MODE", "HEDGE").upper() != "HEDGE")
-
-        # full_close면 거래소 closePosition 변형을 우선 시도(services.place_limit에서 variants[0]로 전송됨)
-        attempt_qty = tp_qty_norm if not full_close else qty_now_norm
+        tp_pos = "LONG" if side.upper() == "BUY" else "SHORT"
         new_id: str | None = None
         try:
             new_id = self.client.place_limit(
                 self.cfg.symbol,
                 tp_side,
-                attempt_qty,
+                tp_qty,
                 tp_price,
-                reduce_only=use_reduce_only,
+                reduce_only=True,
                 position_side=tp_pos,
-                close_position=full_close,
             )
         except Exception as e:
             msg = str(e)
-            # 80001/타임아웃이면 한 번 더 보정: full_close에서 스텝 한 칸 낮춰 재시도(정밀도 충돌 회피)
+            # 잔액 부족(80001)이나 Read timeout 발생 시 TP는 생략하고 attach 모드에서 다시 시도
             if ("80001" in msg) or ("timed out" in msg.lower()):
-                log(f"⚠️ TP 확보 실패 1차: {e}")
-                if full_close:
-                    try:
-                        smaller = norm(max(qty_now_norm - float(step or 1.0), min_allowed))
-                        if smaller > 0:
-                            new_id = self.client.place_limit(
-                                self.cfg.symbol,
-                                tp_side,
-                                smaller,
-                                tp_price,
-                                reduce_only=use_reduce_only,
-                                position_side=tp_pos,
-                                close_position=False,  # 수량을 줄였으니 일반 리밋로
-                            )
-                    except Exception as e2:
-                        log(f"⚠️ TP 확보 실패 2차: {e2}")
-                        new_id = None
-                else:
-                    new_id = None
+                log(f"⚠️ TP 확보 실패: {e}")
+                new_id = None
             else:
                 raise
-
         if new_id:
             self.state.tp_order_id = str(new_id)
             self._last_tp_price = tp_price
-            self._last_tp_qty   = attempt_qty
-            log(f" (attach) TP 확보: id={new_id}, price={tp_price}, qty={attempt_qty}, side={tp_side}/{tp_pos}")
-
-
-
+            self._last_tp_qty = tp_qty
+            log(f" (attach) TP 확보: id={new_id}, price={tp_price}, qty={tp_qty}, side={tp_side}/{tp_pos}")
 
     # ---------- main loop ----------
     def _run(self) -> None:
