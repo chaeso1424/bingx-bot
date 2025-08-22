@@ -122,8 +122,8 @@ class BotRunner:
         self.state.open_limit_ids.clear()
 
     def _ensure_tp_for_current_position(
-        self, pp: int, step: float, min_qty: float, side: str
-    ) -> None:
+            self, pp: int, step: float, min_qty: float, side: str
+        ) -> None:
         """
         현재 보유 포지션(평단/수량)을 기준으로 TP 주문을 확보/재설정한다.
         - DCA/시장가 진입은 하지 않음
@@ -135,8 +135,7 @@ class BotRunner:
         qty_now = float(self.state.position_qty or 0.0)
         if qty_now < min_allowed:
             return
-        
-        
+
         # ✅ 기존 TP 먼저 정리 (attach 진입 시 중복·충돌 방지)
         if self.state.tp_order_id:
             try:
@@ -174,8 +173,7 @@ class BotRunner:
                 oo = self.client.open_orders(self.cfg.symbol)
                 want = str(self.state.tp_order_id)
                 alive = any(
-                    str(o.get("orderId") or o.get("orderID") or o.get("id") or "")
-                    == want
+                    str(o.get("orderId") or o.get("orderID") or o.get("id") or "") == want
                     for o in oo
                 )
                 if alive:
@@ -221,6 +219,7 @@ class BotRunner:
             self._last_tp_price = tp_price
             self._last_tp_qty = tp_qty
             log(f" (attach) TP 확보: id={new_id}, price={tp_price}, qty={tp_qty}, side={tp_side}/{tp_pos}")
+
 
     # ---------- main loop ----------
     def _run(self) -> None:
