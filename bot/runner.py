@@ -135,6 +135,23 @@ class BotRunner:
         qty_now = float(self.state.position_qty or 0.0)
         if qty_now < min_allowed:
             return
+        
+        
+        # ✅ 기존 TP 먼저 정리 (attach 진입 시 중복·충돌 방지)
+        if self.state.tp_order_id:
+            try:
+                self.client.cancel_order(self.cfg.symbol, self.state.tp_order_id)
+                try:
+                    # 있으면 잠깐 대기 (있는 메서드면 사용, 없으면 무시)
+                    self._wait_cancel(self.state.tp_order_id, timeout=2.5)
+                except Exception:
+                    pass
+            except Exception:
+                pass
+            self.state.tp_order_id = None
+            # (선택) 캐시 초기화
+            self._last_tp_price = None
+            self._last_tp_qty = None
 
         entry = float(self.state.position_avg_price or 0.0)
         if entry <= 0:
