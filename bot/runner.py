@@ -459,17 +459,19 @@ class BotRunner:
                 while not self._stop:
                     time.sleep(POLL_SEC)
                     self._refresh_position()
-                    # 오픈오더 조회
+
+                    # 항상 루프 초반에 현재 평단/수량을 먼저 스냅샷
+                    entry_now = float(self.state.position_avg_price or 0.0)
+                    qty_now   = float(self.state.position_qty or 0.0)
+
+                    # 오픈오더 조회 (한 번만)
                     try:
                         open_orders = self.client.open_orders(self.cfg.symbol)
                     except Exception as e:
                         log(f"⚠️ 오픈오더 조회 실패: {e}")
                         open_orders = []
 
-                    # ===== TP 생존/동일수량 검사 (강화) =====
-                    qty_now = float(self.state.position_qty or 0.0)
-
-                    # 1) tracked TP 생존 여부
+                    # TP 생존 확인 (tracked id 기준)
                     tp_alive = False
                     if self.state.tp_order_id:
                         want = str(self.state.tp_order_id)
@@ -479,53 +481,11 @@ class BotRunner:
                                 tp_alive = True
                                 break
 
-                    # 2) ID와 무관하게 "현재 포지션과 동일 수량 TP"가 이미 있는지 검사
-                    want_side = "SELL" if side == "BUY" else "BUY"
-                    want_pos  = "LONG" if side == "BUY" else "SHORT"
-                    tp_equal_exists = False
-                    tp_equal_id = None
-                    tp_equal_price = None
-                    for o in open_orders:
-                        # 오더의 side / positionSide 파싱
-                        o_side = str(o.get("side") or o.get("orderSide") or "").upper()
-                        o_pos  = str(o.get("positionSide") or o.get("posSide") or o.get("position_side") or "").upper()
-                        if (o_side != want_side) or (o_pos != want_pos):
-                            continue
-                        # 수량 파싱
-                        q = o.get("origQty") or o.get("quantity") or o.get("qty") or o.get("orig_quantity")
-                        try:
-                            oq = float(q) if q is not None else 0.0
-                        except Exception:
-                            oq = 0.0
-                        # 동일 수량(±step) 판단
-                        if abs(qty_now - oq) < float(step or 1.0):
-                            tp_equal_exists = True
-                            tp_equal_id = str(o.get("orderId") or o.get("orderID") or o.get("id") or "")
-                            # 가격은 있으면 기록(없어도 무방)
-                            p = o.get("price") or o.get("origPrice") or o.get("limitPrice")
-                            try:
-                                tp_equal_price = float(p) if p is not None else None
-                            except Exception:
-                                tp_equal_price = None
-                            break
-
-                    # 3) 동일 수량 TP가 이미 있으면 → 스킵(감시 모드로 지속)
-                    if tp_equal_exists:
-                        if not tp_alive:
-                            # 트래킹되지 않았던 TP라면 채택해서 추후 비교/취소가 가능하도록 함
-                            self.state.tp_order_id = tp_equal_id
-                            self._last_tp_price = tp_equal_price if tp_equal_price else self._last_tp_price
-                            self._last_tp_qty = qty_now
-                            log(f"ℹ️ 기존 TP 채택: id={tp_equal_id}, qty≈{qty_now}")
-                        # 동일 수량이므로 재설정/재발주 불필요 → 다음 폴링으로
-                        continue
-                            
                     # ----- 종료 판정 (연속 N회 + TP 미생존 + 이중확인) -----
                     tick = 10 ** (-pp) if pp > 0 else 0.01
-                    min_allowed = max(float(min_qty or 0.0), float(step or 0.0))
+                    min_allowed = max(float(min_qty or 0.0), float(step or 0.0))  # 수량 기준만
                     zero_eps = min_allowed * ZERO_EPS_FACTOR
 
-                    qty_now = float(self.state.position_qty or 0.0)
                     if qty_now < zero_eps:
                         zero_streak += 1
                     else:
@@ -550,24 +510,60 @@ class BotRunner:
                         else:
                             zero_streak = 0
 
+                    # ===== TP 생존/동일 수량 검사 (ID와 무관하게 탐지)
+                    want_side = "SELL" if side == "BUY" else "BUY"
+                    want_pos  = "LONG" if side == "BUY" else "SHORT"
+
+                    tp_equal_exists = False
+                    tp_equal_id = None
+                    tp_equal_price = None
+                    for o in open_orders:
+                        o_side = str(o.get("side") or o.get("orderSide") or "").upper()
+                        o_pos  = str(o.get("positionSide") or o.get("posSide") or o.get("position_side") or "").upper()
+                        if (o_side != want_side) or (o_pos != want_pos):
+                            continue
+                        q = o.get("origQty") or o.get("quantity") or o.get("qty") or o.get("orig_quantity")
+                        try:
+                            oq = float(q) if q is not None else 0.0
+                        except Exception:
+                            oq = 0.0
+                        if abs(qty_now - oq) < float(step or 1.0):
+                            tp_equal_exists = True
+                            tp_equal_id = str(o.get("orderId") or o.get("orderID") or o.get("id") or "")
+                            p = o.get("price") or o.get("origPrice") or o.get("limitPrice")
+                            try:
+                                tp_equal_price = float(p) if p is not None else None
+                            except Exception:
+                                tp_equal_price = None
+                            break
+
+                    # 동일 수량 TP가 이미 있으면 → 감시 모드로 스킵 (재발주 금지)
+                    if tp_equal_exists:
+                        if not tp_alive:
+                            # 트래킹되지 않은 TP라면 채택
+                            self.state.tp_order_id = tp_equal_id
+                            if tp_equal_price is not None:
+                                self._last_tp_price = tp_equal_price
+                            self._last_tp_qty = qty_now
+                            log(f"ℹ️ 기존 TP 채택: id={tp_equal_id}, qty≈{qty_now}")
+                        continue
+
                     # ----- TP 재설정(데드밴드 + 쿨다운) -----
                     need_reset_tp = False
-                    last_entry = float(last_entry or 0.0) if 'last_entry' in locals() else 0.0
-                    if entry_now <= 0 and last_entry and last_entry > 0:
-                        entry_now = last_entry
 
+                    # 평단 대체는 entry_now를 덮어쓰지 말고 별도 변수로
+                    eff_entry = entry_now if entry_now > 0 else float(last_entry or 0.0)
                     if not tp_alive:
-                        need_reset_tp = (qty_now >= min_allowed and entry_now > 0)
+                        need_reset_tp = (qty_now >= min_allowed and eff_entry > 0)
                     else:
-                        if qty_now >= min_allowed and entry_now > 0:
-                            ideal_price = tp_price_from_roi(entry_now, side, float(self.cfg.tp_percent), int(self.cfg.leverage), pp)
-                            ideal_qty = max(floor_to_step(qty_now, step), min_allowed)
-                            # 보유 수량 초과 금지
-                            ideal_qty = min(ideal_qty, qty_now)
+                        if qty_now >= min_allowed and eff_entry > 0:
+                            ideal_price = tp_price_from_roi(eff_entry, side, float(self.cfg.tp_percent), int(self.cfg.leverage), pp)
+                            ideal_qty   = max(floor_to_step(qty_now, step), min_allowed)
+                            ideal_qty   = min(ideal_qty, qty_now)  # 보유 수량 초과 금지
 
                             if (last_entry is None) or (last_tp_price is None) or (last_tp_qty is None):
                                 need_reset_tp = True
-                            elif (abs(entry_now - last_entry) >= 2 * tick) or \
+                            elif (abs(eff_entry - last_entry) >= 2 * tick) or \
                                 (abs(ideal_price - last_tp_price) >= 2 * tick) or \
                                 (abs(ideal_qty - last_tp_qty) >= float(step or 1.0)):
                                 need_reset_tp = True
@@ -584,13 +580,12 @@ class BotRunner:
                             except Exception as e:
                                 log(f"⚠️ TP 취소 실패(무시): {e}")
 
-                        if entry_now <= 0 or qty_now < min_allowed:
+                        if eff_entry <= 0 or qty_now < min_allowed:
                             continue
 
-                        new_price = tp_price_from_roi(entry_now, side, float(self.cfg.tp_percent), int(self.cfg.leverage), pp)
-                        new_qty = max(floor_to_step(qty_now, step), min_allowed)
-                        # 보유 수량 초과 금지
-                        new_qty = min(new_qty, qty_now)
+                        new_price = tp_price_from_roi(eff_entry, side, float(self.cfg.tp_percent), int(self.cfg.leverage), pp)
+                        new_qty   = max(floor_to_step(qty_now, step), min_allowed)
+                        new_qty   = min(new_qty, qty_now)  # 보유 수량 초과 금지
 
                         new_side = "SELL" if side == "BUY" else "BUY"
                         new_pos  = "LONG" if side == "BUY" else "SHORT"
@@ -606,13 +601,12 @@ class BotRunner:
                         except Exception as e:
                             msg = str(e)
                             if ("80001" in msg) or ("timed out" in msg.lower()):
-                                # 잔액부족/타임아웃이면 이번 재설정만 건너뜀
                                 continue
                             else:
                                 raise
 
                         self.state.tp_order_id = str(new_id)
-                        last_entry     = entry_now
+                        last_entry     = eff_entry
                         last_tp_price  = new_price
                         last_tp_qty    = new_qty
                         self._last_tp_price = new_price
