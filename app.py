@@ -2,7 +2,7 @@
 import os
 import json
 from pathlib import Path
-from flask import Flask, render_template, request, jsonify
+from flask import Flask, render_template, request, jsonify, Response
 from dotenv import load_dotenv
 
 from utils.logging import log
@@ -10,6 +10,8 @@ from models.config import BotConfig
 from models.state import BotState
 from services.bingx_client import BingXClient, BASE, _req_get, _ts
 from bot.runner import BotRunner
+
+LOG_FILE = Path("./logs.txt")
 
 # ───────────────────────────────────────────────────────────────────────────────
 # 0) 환경 로드 (.env는 파일 위치 기준으로 확실히 읽기)
@@ -113,23 +115,14 @@ def index():
     )
 
 @app.route("/logs")
-def view_logs():
-    """로그 페이지: logs.txt 파일을 읽어서 화면에 표시"""
-    log_file = Path("logs.txt")
-    if log_file.exists():
-        with open(log_file, "r", encoding="utf-8") as f:
-            log_lines = f.read().splitlines()
-    else:
-        # 로그 파일이 없으면 빈 리스트 반환
-        log_lines = []
-    return render_template("logs.html", logs=log_lines)
+def logs_page():
+    return render_template("logs.html")
 
 
-LOG_FILE = Path("./logs.txt") 
-
-@app.get("/logs/text")
+@app.route("/logs/text")
 def logs_text():
-    tail = int(request.args.get("tail", "500"))  # 마지막 500줄
+    """마지막 500줄 로그를 내려주는 단순 엔드포인트"""
+    tail = 500
     try:
         LOG_FILE.touch(exist_ok=True)
         with LOG_FILE.open("r", encoding="utf-8", errors="ignore") as f:
@@ -137,8 +130,6 @@ def logs_text():
         body = "".join(lines[-tail:])
     except Exception:
         body = ""
-
-    # 캐시 방지 헤더 (항상 새로 받게)
     headers = {
         "Cache-Control": "no-cache, no-store, must-revalidate",
         "Pragma": "no-cache",
