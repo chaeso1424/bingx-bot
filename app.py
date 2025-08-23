@@ -1,8 +1,8 @@
 # app.py
-import os
+import os, time
 import json
 from pathlib import Path
-from flask import Flask, render_template, request, jsonify
+from flask import Flask, render_template, request, jsonify, Response, stream_with_context, request, render_template
 from dotenv import load_dotenv
 
 from utils.logging import log
@@ -11,6 +11,7 @@ from models.state import BotState
 from services.bingx_client import BingXClient, BASE, _req_get, _ts
 from bot.runner import BotRunner
 
+LOG_FILE = Path("./logs.txt")
 # ───────────────────────────────────────────────────────────────────────────────
 # 0) 환경 로드 (.env는 파일 위치 기준으로 확실히 읽기)
 # ───────────────────────────────────────────────────────────────────────────────
@@ -123,6 +124,47 @@ def view_logs():
         # 로그 파일이 없으면 빈 리스트 반환
         log_lines = []
     return render_template("logs.html", logs=log_lines)
+
+# 실시간 스트림 (SSE)
+@app.get("/logs/stream")
+def logs_stream():
+    tail_lines = int(request.args.get("tail", "300"))  # 처음에 마지막 N줄만 보내기
+    interval   = float(request.args.get("interval", "0.8"))  # 폴링 주기(초)
+    LOG_FILE.touch(exist_ok=True)
+
+    def tailer():
+        # 1) 처음 구독 시 마지막 tail_lines 줄 먼저 전송
+        try:
+            with LOG_FILE.open("r", encoding="utf-8", errors="ignore") as f:
+                f.seek(0, os.SEEK_END)
+                size = f.tell()
+                # 거꾸로 tail_lines 줄만큼 읽기 (간단 구현: 전체 읽고 뒤에서 자르기)
+                f.seek(0)
+                lines = f.readlines()
+        except Exception:
+            lines = []
+
+        for line in lines[-tail_lines:]:
+            yield f"data: {line.rstrip()}\n\n"
+
+        # 2) 이후에는 파일의 새로운 내용이 생길 때마다 밀어내기
+        with LOG_FILE.open("r", encoding="utf-8", errors="ignore") as f:
+            f.seek(0, os.SEEK_END)  # 파일 끝으로 이동(신규만)
+            while True:
+                line = f.readline()
+                if line:
+                    yield f"data: {line.rstrip()}\n\n"
+                else:
+                    time.sleep(interval)
+
+    headers = {
+        "Cache-Control": "no-cache",
+        "X-Accel-Buffering": "no",   # nginx 버퍼링 방지
+        "Connection": "keep-alive",
+    }
+    return Response(stream_with_context(tailer()),
+                    mimetype="text/event-stream",
+                    headers=headers)
 
 @app.get("/symbols")
 def symbols():
