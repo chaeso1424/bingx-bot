@@ -548,6 +548,7 @@ class BotRunner:
                             log(f"ℹ️ 기존 TP 채택: id={tp_equal_id}, qty≈{qty_now}")
                         continue
 
+
                     # ----- TP 재설정(데드밴드 + 쿨다운) -----
                     need_reset_tp = False
 
