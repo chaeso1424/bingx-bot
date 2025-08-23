@@ -9,3 +9,32 @@ input, select, button { background:#0f1320; color:#e6e6e6; border:1px solid #253
 button { cursor:pointer; }
 .status div { margin:4px 0; }
 .dca > div:first-child { width:40px; }
+
+/* 상단 헤더 바 스타일 */
+.topbar {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  background-color: #222;
+  color: #fff;
+  padding: 12px 20px;
+  font-size: 20px;
+  font-weight: bold;
+}
+
+.topbar .title {
+  font-size: 22px;
+}
+
+.topbar .nav .log-btn {
+  background: #4cafef;
+  color: #fff;
+  padding: 8px 16px;
+  border-radius: 4px;
+  text-decoration: none;
+  font-size: 14px;
+}
+
+.topbar .nav .log-btn:hover {
+  background: #3a9bd9;
+}

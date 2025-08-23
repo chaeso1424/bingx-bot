@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="ko">
+  <head>
+    <meta charset="utf-8">
+    <title>로그 보기</title>
+    <style>
+      body {
+        font-family: Arial, sans-serif;
+        margin: 40px;
+        background-color: #fdfdfd;
+      }
+      h1 {
+        color: #333;
+      }
+      pre {
+        background-color: #f0f0f0;
+        padding: 15px;
+        border-radius: 4px;
+        overflow: auto;
+        max-height: 70vh;
+      }
+      a {
+        display: inline-block;
+        margin-top: 20px;
+        text-decoration: none;
+        color: #007bff;
+      }
+      a:hover {
+        text-decoration: underline;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>로그 내역</h1>
+    {% if logs %}
+      <pre>
+{% for line in logs %}
+{{ line }}
+{% endfor %}
+      </pre>
+    {% else %}
+      <p>표시할 로그가 없습니다.</p>
+    {% endif %}
+    <a href="/">← 홈으로 돌아가기</a>
+  </body>
+</html>

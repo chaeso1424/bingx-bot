@@ -112,6 +112,18 @@ def index():
         available_usdt=avail,
     )
 
+@app.route("/logs")
+def view_logs():
+    """로그 페이지: logs.txt 파일을 읽어서 화면에 표시"""
+    log_file = Path("logs.txt")
+    if log_file.exists():
+        with open(log_file, "r", encoding="utf-8") as f:
+            log_lines = f.read().splitlines()
+    else:
+        # 로그 파일이 없으면 빈 리스트 반환
+        log_lines = []
+    return render_template("logs.html", logs=log_lines)
+
 @app.get("/symbols")
 def symbols():
     try:
