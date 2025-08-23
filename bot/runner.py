@@ -122,64 +122,63 @@ class BotRunner:
         self.state.open_limit_ids.clear()
 
     def _ensure_tp_for_current_position(
-            self, pp: int, step: float, min_qty: float, side: str
-        ) -> None:
+        self, pp: int, step: float, min_qty: float, side: str
+    ) -> None:
         """
         현재 보유 포지션(평단/수량)을 기준으로 TP 주문을 확보/재설정한다.
         - DCA/시장가 진입은 하지 않음
         - 기존 TP가 살아있고 변화가 미미하면 유지(데드밴드)
-        - 추가: TP 주문 수량이 현재 포지션 수량과 같으면 초반에 바로 패스
         """
-        tick = 10 ** (-pp) if pp > 0 else 0.01  # 가격 최소 호가(가격 비교용)
-        min_allowed = max(float(min_qty or 0.0), float(step or 0.0))  # 수량 최소 기준(수량 비교용)
+        tick = 10 ** (-pp) if pp > 0 else 0.01
+        min_allowed = max(float(min_qty or 0.0), float(step or 0.0), tick)
+
+        try:
+            # 현재 포지션 수량 조회
+            qty_now = float(self.state.position_qty or 0.0)
+
+            if not self.state.tp_order_id:
+                return False
+
+            # 오픈 오더 조회
+            oo = self.client.open_orders(self.cfg.symbol)
+            want = str(self.state.tp_order_id)
+            alive = None
+            for o in oo:
+                oid = str(o.get("orderId") or o.get("orderID") or o.get("id") or "")
+                if oid == want:
+                    alive = o
+                    break
+
+            if alive:
+                # TP 주문 수량 추출
+                tp_order_qty = alive.get("origQty") or alive.get("quantity") or alive.get("qty") or alive.get("orig_quantity")
+                tp_order_qty = float(tp_order_qty) if tp_order_qty is not None else 0.0
+
+                # step 오차 이내 동일 여부 판별
+                if abs(qty_now - tp_order_qty) < float(step or 1.0):
+                    return True  # 같으면 패스
+        except Exception:
+            pass
 
         qty_now = float(self.state.position_qty or 0.0)
-
-        # 🔹 추가: 현재 TP 주문 수량이 포지션 수량과 같으면 초반에 바로 패스
-        if self.state.tp_order_id:
-            try:
-                oo = self.client.open_orders(self.cfg.symbol)
-                want = str(self.state.tp_order_id)
-                alive = None
-                for o in oo:
-                    oid = str(o.get("orderId") or o.get("orderID") or o.get("id") or "")
-                    if oid == want:
-                        alive = o
-                        break
-                if alive is not None:
-                    tp_order_qty = alive.get("origQty")
-                    if tp_order_qty is None:
-                        tp_order_qty = alive.get("quantity") or alive.get("qty") or alive.get("orig_quantity")
-                    try:
-                        tp_order_qty = float(tp_order_qty) if tp_order_qty is not None else float(self._last_tp_qty or 0.0)
-                    except Exception:
-                        tp_order_qty = float(self._last_tp_qty or 0.0)
-                    # step 오차 이내로 동일하면 루프 패스
-                    if abs(float(qty_now) - float(tp_order_qty)) < float(step or 1.0):
-                        return
-            except Exception:
-                # TP 조회 실패 시 패스 조건은 건너뛰고 아래 가드/재설정 로직으로 진행
-                pass
-
-        # 포지션 수량이 의미 없으면 종료
-        if qty_now < (min_allowed * 0.999):
+        if qty_now < min_allowed:
             return
 
         entry = float(self.state.position_avg_price or 0.0)
-        # 평단이 없으면(또는 0이면) TP 생성 회피: attach 모드 일관성 유지
         if entry <= 0:
-            return
+            try:
+                entry = float(self.client.get_mark_price(self.cfg.symbol))
+            except Exception:
+                entry = float(self.client.get_last_price(self.cfg.symbol))
+
+        
 
         tp_price = tp_price_from_roi(entry, side, float(self.cfg.tp_percent), int(self.cfg.leverage), pp)
-        if not (tp_price and tp_price > 0):
-            return
-
         tp_qty = floor_to_step(qty_now, float(step or 1.0))
-        # 최소 수량 보장 + 보유 수량 초과 금지
         if tp_qty < min_allowed:
             tp_qty = min_allowed
-        if tp_qty > qty_now:
-            tp_qty = qty_now
+        if not (tp_price and tp_price > 0):
+            return
 
         price_changed = True
         qty_changed = True
@@ -188,7 +187,8 @@ class BotRunner:
                 oo = self.client.open_orders(self.cfg.symbol)
                 want = str(self.state.tp_order_id)
                 alive = any(
-                    str(o.get("orderId") or o.get("orderID") or o.get("id") or "") == want
+                    str(o.get("orderId") or o.get("orderID") or o.get("id") or "")
+                    == want
                     for o in oo
                 )
                 if alive:
@@ -234,7 +234,6 @@ class BotRunner:
             self._last_tp_price = tp_price
             self._last_tp_qty = tp_qty
             log(f" (attach) TP 확보: id={new_id}, price={tp_price}, qty={tp_qty}, side={tp_side}/{tp_pos}")
-
 
     # ---------- main loop ----------
     def _run(self) -> None:
