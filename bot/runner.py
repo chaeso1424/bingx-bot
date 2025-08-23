@@ -114,12 +114,84 @@ class BotRunner:
         self.state.position_qty = qty
 
     def _cancel_tracked_limits(self) -> None:
+        """
+        1) 추적 중인 리밋오더만 먼저 취소
+        2) 해당 심볼의 오픈오더가 남아있으면 '추적 여부/종류 무관' 전부 취소
+        3) 종료
+        - 멱등하게 동작: 이미 체결/취소된 오더는 조용히 건너뜀
+        """
+        symbol = self.cfg.symbol
+
+        def _oid(o: dict) -> str:
+            return str(o.get("orderId") or o.get("orderID") or o.get("id") or "")
+
+        # --- 0) 현재 오픈오더 스냅샷(심볼 한정)
+        try:
+            open_orders = self.client.open_orders(symbol) or []
+        except Exception as e:
+            # 조회 실패해도 추적 리밋 취소는 시도
+            open_orders = []
+        open_ids = {_oid(o) for o in open_orders if _oid(o)}
+
+        # --- 1) 추적 중인 리밋을 '지금도 오픈'인 것만 취소
         for oid in list(self.state.open_limit_ids):
+            if oid not in open_ids:
+                continue  # 이미 체결/취소된 건 조용히 스킵
             try:
-                self.client.cancel_order(self.cfg.symbol, oid)
+                self.client.cancel_order(symbol, oid)
+                # 선택: 빠른 동기화를 원하면 짧게 기다려도 됨
+                try:
+                    self._wait_cancel(oid, timeout=1.0)
+                except Exception:
+                    pass
             except Exception as e:
-                log(f"⚠️ 리밋 취소 실패: {oid} {e}")
+                msg = str(e)
+                # 타임아웃/이미-없음 류는 정상 흐름으로 간주
+                if ("80001" in msg) or ("timed out" in msg.lower()) or ("not found" in msg.lower()):
+                    pass
+                else:
+                    log(f"⚠️ 리밋 취소 실패: {oid} {msg}")
+
+        # 추적 리스트는 일단 비움(멱등 보장)
         self.state.open_limit_ids.clear()
+
+        # --- 2) 재스냅샷: 심볼에 오픈오더가 남아있는지 확인
+        try:
+            remain = self.client.open_orders(symbol) or []
+        except Exception:
+            remain = []
+
+        if not remain:
+            # TP 트래킹도 안전하게 초기화 (남은 오더 없으니)
+            if self.state.tp_order_id:
+                self.state.tp_order_id = None
+            return
+
+        # --- 3) 남은 오더가 있다면: 추적 여부/종류 무관하게 전부 취소 (TP 포함)
+        cancelled_ids = set()
+        for o in remain:
+            oid = _oid(o)
+            if not oid:
+                continue
+            try:
+                self.client.cancel_order(symbol, oid)
+                cancelled_ids.add(oid)
+                try:
+                    self._wait_cancel(oid, timeout=1.0)
+                except Exception:
+                    pass
+            except Exception as e:
+                msg = str(e)
+                if ("80001" in msg) or ("timed out" in msg.lower()) or ("not found" in msg.lower()):
+                    # 경합/이미 취소/타임아웃은 무시
+                    pass
+                else:
+                    log(f"⚠️ 오더 취소 실패: {oid} ({msg})")
+
+        # --- 4) TP 트래킹 정리(취소됐든 아니든 트래킹만 초기화)
+        if self.state.tp_order_id:
+            self.state.tp_order_id = None
+
 
 
     # ---------- main loop ----------
@@ -385,14 +457,10 @@ class BotRunner:
                             chk_avg, chk_qty = 0.0, 0.0
                         if float(chk_qty or 0.0) < zero_eps:
                             # 포지션 완전 청산 → DCA/TP 전부 정리
-                            self._cancel_tracked_limits()
-                            if self.state.tp_order_id:
-                                try:
-                                    self.client.cancel_order(self.cfg.symbol, self.state.tp_order_id)
-                                except Exception:
-                                    pass
-                                self.state.tp_order_id = None
-                            log("✅ 포지션 종료 확정(연속검증+이중확인) → 대기")
+                            want_pos = "LONG" if side == "BUY" else "SHORT"
+                            self._cancel_tracked_limits(self.cfg.symbol, want_pos, retries=3, wait_each=2.0)
+                            self.state.reset_orders()
+                            log("✅ 포지션 종료 확정(연속검증+이중확인) → 모든 오더 정리 완료, 대기")
                             break
                         else:
                             zero_streak = 0
@@ -507,14 +575,8 @@ class BotRunner:
                 if not self.state.repeat_mode:
                     break
                 else:
-                    # 남은 오더 안전정리(attach 여부와 무관하게 전부 정리)
-                    self._cancel_tracked_limits()
-                    if self.state.tp_order_id:
-                        try:
-                            self.client.cancel_order(self.cfg.symbol, self.state.tp_order_id)
-                        except Exception:
-                            pass
-                        self.state.tp_order_id = None
+                    want_pos = "LONG" if side == "BUY" else "SHORT"
+                    self._cancel_tracked_limits(include_untracked=True, pos_side=want_pos, cancel_tp=True)
                     self.state.reset_orders()
 
                     delay = max(0, RESTART_DELAY_SEC)
