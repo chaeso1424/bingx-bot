@@ -235,26 +235,53 @@ class BingXClient:
     def _try_order(self, url: str, variants: list[dict]) -> str:
         """
         variants를 순차 시도. 성공하면 orderId 반환.
+        - orderId를 찾았을 때는 어떤 로그도 남기지 않음
+        - 못 찾았을 때만 오류 로그 남기고 다음 variant 시도
         """
+        import json
         last_err = None
-        for body in variants:
+
+        for i, body in enumerate(variants):
             try:
                 j = _req_post(url, body, signed=True)
-                oid = self._extract_order_id(j)
-                if oid:
-                    return str(oid)
+
+                # 1) 주 추출 경로
+                oid = None
                 try:
-                    o = (j.get("data") or {}).get("order") or {}
-                    oid = o.get("orderId") or o.get("orderID") or o.get("id")
+                    oid = self._extract_order_id(j)
                 except Exception:
                     oid = None
+
+                # 2) 폴백(필요 시)
+                if not oid:
+                    try:
+                        o = (j.get("data") or {}).get("order") or {}
+                        oid = o.get("orderId") or o.get("orderID") or o.get("id")
+                    except Exception:
+                        oid = None
+
+                # ✅ 찾았으면 즉시 반환(로그 없음)
                 if oid:
                     return str(oid)
-                last_err = RuntimeError(f"missing orderId in response: {j}")
+
+                # ❌ 못 찾았으면: code/msg 포함해서 간단 로그 후 다음 variant
+                code = (j or {}).get("code")
+                msg  = (j or {}).get("msg") or (j or {}).get("message")
+                try:
+                    preview = json.dumps(j, ensure_ascii=False)[:300]
+                except Exception:
+                    preview = str(j)[:300]
+
+                log(f"⚠️ order variant#{i+1}: missing orderId (code={code}, msg={msg}) resp={preview}")
+                last_err = RuntimeError(f"missing orderId in response (variant#{i+1})")
+
             except Exception as e:
+                # 요청 자체 실패 등 예외는 그대로 기록 후 다음 variant
                 last_err = e
-                log(f"⚠️ order variant failed: {e}")
+                log(f"⚠️ order variant#{i+1} failed: {e}")
                 continue
+
+        # 모든 시도 실패
         raise last_err or RuntimeError("all order variants failed")
 
     # ----- Market / Quote -----
