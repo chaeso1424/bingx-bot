@@ -33,60 +33,49 @@
   </div>
 
   <script>
-    const logbox = document.getElementById('logbox');
-    const btnPause = document.getElementById('pause');
-    const btnClear = document.getElementById('clear');
+    const logbox   = document.getElementById('logbox');   // <pre id="logbox"></pre>
+    const btnPause = document.getElementById('pause');    // (있으면) 일시정지 버튼
+    const btnClear = document.getElementById('clear');    // (있으면) 지우기 버튼
 
-    // 너무 길어지지 않게 브라우저 메모리 보호
-    const MAX_LINES = 2000;
-
-    // 자동 스크롤(사용자가 맨 아래 보고 있을 때만)
-    function isAtBottom() {
+    // 사용자가 맨 아래를 보고 있는지 확인
+    function atBottom() {
       return (logbox.scrollTop + logbox.clientHeight) >= (logbox.scrollHeight - 4);
     }
-    function appendLine(text) {
-      const atBottom = isAtBottom();
-      logbox.textContent += (logbox.textContent ? '\n' : '') + text;
-      // 오래된 라인 제거
-      const lines = logbox.textContent.split('\n');
-      if (lines.length > MAX_LINES) {
-        logbox.textContent = lines.slice(-MAX_LINES).join('\n');
-      }
-      if (atBottom) {
-        logbox.scrollTop = logbox.scrollHeight;
+
+    async function refreshLogs() {
+      try {
+        if (btnPause && btnPause.dataset.paused === 'true') return;
+
+        const res  = await fetch('/logs/text?tail=500&ts=' + Date.now(), { cache: 'no-store' });
+        const text = await res.text();
+
+        const wasBottom = atBottom();
+        logbox.textContent = text;
+        if (wasBottom) {
+          logbox.scrollTop = logbox.scrollHeight;
+        }
+      } catch (e) {
+        // 조용히 무시 → 다음 틱에 재시도
       }
     }
 
-    // SSE 구독
-    let es = null;
-    function connect() {
-      if (es) es.close();
-      // tail=300 줄부터, interval=0.8초 폴링
-      es = new EventSource('/logs/stream?tail=300&interval=0.8');
-      es.onmessage = (e) => {
-        if (btnPause.dataset.paused === 'true') return;
-        appendLine(e.data);
-      };
-      es.onerror = () => {
-        // 잠깐 끊기면 재연결 시도
-        if (es) es.close();
-        setTimeout(connect, 1500);
-      };
+    // 1.5초 간격으로 업데이트(원하면 800~2000ms로 조정)
+    const intervalMs = 1500;
+    setInterval(refreshLogs, intervalMs);
+    // 최초 1회
+    refreshLogs();
+
+    // 선택) 일시정지/지우기 버튼 연결
+    if (btnPause) {
+      btnPause.addEventListener('click', () => {
+        const paused = btnPause.dataset.paused === 'true';
+        btnPause.dataset.paused = String(!paused);
+        btnPause.textContent = paused ? '⏸ 일시정지' : '▶ 다시보기';
+      });
     }
-    connect();
-
-    // 버튼 동작
-    btnPause.addEventListener('click', () => {
-      const paused = btnPause.dataset.paused === 'true';
-      btnPause.dataset.paused = String(!paused);
-      btnPause.textContent = paused ? '⏸ 일시정지' : '▶ 다시보기';
-    });
-    btnClear.addEventListener('click', () => {
-      logbox.textContent = '';
-    });
-
-    // 페이지 떠나면 연결 닫기
-    window.addEventListener('beforeunload', () => { if (es) es.close(); });
+    if (btnClear) {
+      btnClear.addEventListener('click', () => { logbox.textContent = ''; });
+    }
   </script>
 </body>
 </html>
