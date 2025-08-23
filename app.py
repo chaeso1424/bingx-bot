@@ -124,6 +124,28 @@ def view_logs():
         log_lines = []
     return render_template("logs.html", logs=log_lines)
 
+
+LOG_FILE = Path("./logs.txt") 
+
+@app.get("/logs/text")
+def logs_text():
+    tail = int(request.args.get("tail", "500"))  # 마지막 500줄
+    try:
+        LOG_FILE.touch(exist_ok=True)
+        with LOG_FILE.open("r", encoding="utf-8", errors="ignore") as f:
+            lines = f.readlines()
+        body = "".join(lines[-tail:])
+    except Exception:
+        body = ""
+
+    # 캐시 방지 헤더 (항상 새로 받게)
+    headers = {
+        "Cache-Control": "no-cache, no-store, must-revalidate",
+        "Pragma": "no-cache",
+        "Expires": "0",
+    }
+    return Response(body, mimetype="text/plain", headers=headers)
+
 @app.get("/symbols")
 def symbols():
     try:
