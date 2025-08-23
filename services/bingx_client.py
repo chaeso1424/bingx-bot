@@ -135,7 +135,7 @@ class BingXClient:
                     pass
         return None
 
-    # (없으면 추가) 주문 응답에서 orderId 추출
+    #주문 응답에서 orderId 추출
     def _extract_order_id(self, resp: dict) -> str:
         """
         BingX 주문 응답에서 orderId를 최대한 유연하게 추출한다.
