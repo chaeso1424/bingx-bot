@@ -458,7 +458,7 @@ class BotRunner:
                         if float(chk_qty or 0.0) < zero_eps:
                             # 포지션 완전 청산 → DCA/TP 전부 정리
                             want_pos = "LONG" if side == "BUY" else "SHORT"
-                            self._cancel_tracked_limits(self.cfg.symbol, want_pos, retries=3, wait_each=2.0)
+                            self._cancel_tracked_limits(include_untracked=True, pos_side=want_pos, cancel_tp=True)
                             self.state.reset_orders()
                             log("✅ 포지션 종료 확정(연속검증+이중확인) → 모든 오더 정리 완료, 대기")
                             break
