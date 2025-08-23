@@ -1,46 +1,92 @@
 <!doctype html>
 <html lang="ko">
-  <head>
-    <meta charset="utf-8">
-    <title>로그 보기</title>
-    <style>
-      body {
-        font-family: Arial, sans-serif;
-        margin: 40px;
-        background-color: #fdfdfd;
+<head>
+  <meta charset="utf-8"/>
+  <title>로그 보기</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <style>
+    body { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; margin: 0; background:#0b0f14; color:#cdd9e5; }
+    .topbar { display:flex; justify-content:space-between; align-items:center; background:#111921; color:#e6edf3; padding:12px 16px; position:sticky; top:0; z-index:10; }
+    .btn { background:#2b6cb0; color:#fff; border:0; padding:8px 12px; border-radius:6px; text-decoration:none; cursor:pointer; }
+    .btn:hover { filter:brightness(1.05); }
+    .wrap { padding:12px 16px; }
+    #logbox { white-space:pre-wrap; background:#0e1621; border:1px solid #1f2a37; border-radius:8px; padding:12px; line-height:1.4; height:70vh; overflow:auto; }
+    .muted { color:#9aa7b2; font-size:12px; }
+    .toolbar { display:flex; gap:8px; align-items:center; margin:10px 0; }
+  </style>
+</head>
+<body>
+  <header class="topbar">
+    <div>📜 실시간 로그</div>
+    <div>
+      <a href="/" class="btn">← 대시보드</a>
+    </div>
+  </header>
+
+  <div class="wrap">
+    <div class="toolbar">
+      <button id="pause" class="btn" data-paused="false">⏸ 일시정지</button>
+      <button id="clear" class="btn">🧹 지우기</button>
+      <span class="muted">자동 갱신 • 마지막 300줄부터 표시</span>
+    </div>
+    <pre id="logbox"></pre>
+  </div>
+
+  <script>
+    const logbox = document.getElementById('logbox');
+    const btnPause = document.getElementById('pause');
+    const btnClear = document.getElementById('clear');
+
+    // 너무 길어지지 않게 브라우저 메모리 보호
+    const MAX_LINES = 2000;
+
+    // 자동 스크롤(사용자가 맨 아래 보고 있을 때만)
+    function isAtBottom() {
+      return (logbox.scrollTop + logbox.clientHeight) >= (logbox.scrollHeight - 4);
+    }
+    function appendLine(text) {
+      const atBottom = isAtBottom();
+      logbox.textContent += (logbox.textContent ? '\n' : '') + text;
+      // 오래된 라인 제거
+      const lines = logbox.textContent.split('\n');
+      if (lines.length > MAX_LINES) {
+        logbox.textContent = lines.slice(-MAX_LINES).join('\n');
       }
-      h1 {
-        color: #333;
+      if (atBottom) {
+        logbox.scrollTop = logbox.scrollHeight;
       }
-      pre {
-        background-color: #f0f0f0;
-        padding: 15px;
-        border-radius: 4px;
-        overflow: auto;
-        max-height: 70vh;
-      }
-      a {
-        display: inline-block;
-        margin-top: 20px;
-        text-decoration: none;
-        color: #007bff;
-      }
-      a:hover {
-        text-decoration: underline;
-      }
-    </style>
-  </head>
-  <body>
-    <h1>로그 내역</h1>
-    {% if logs %}
-      <pre>
-{% for line in logs %}
-{{ line }}
-{% endfor %}
-      </pre>
-    {% else %}
-      <p>표시할 로그가 없습니다.</p>
-    {% endif %}
-    <a href="/">← 홈으로 돌아가기</a>
-  </body>
+    }
+
+    // SSE 구독
+    let es = null;
+    function connect() {
+      if (es) es.close();
+      // tail=300 줄부터, interval=0.8초 폴링
+      es = new EventSource('/logs/stream?tail=300&interval=0.8');
+      es.onmessage = (e) => {
+        if (btnPause.dataset.paused === 'true') return;
+        appendLine(e.data);
+      };
+      es.onerror = () => {
+        // 잠깐 끊기면 재연결 시도
+        if (es) es.close();
+        setTimeout(connect, 1500);
+      };
+    }
+    connect();
+
+    // 버튼 동작
+    btnPause.addEventListener('click', () => {
+      const paused = btnPause.dataset.paused === 'true';
+      btnPause.dataset.paused = String(!paused);
+      btnPause.textContent = paused ? '⏸ 일시정지' : '▶ 다시보기';
+    });
+    btnClear.addEventListener('click', () => {
+      logbox.textContent = '';
+    });
+
+    // 페이지 떠나면 연결 닫기
+    window.addEventListener('beforeunload', () => { if (es) es.close(); });
+  </script>
+</body>
 </html>
