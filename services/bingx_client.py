@@ -232,31 +232,6 @@ class BingXClient:
             log(f"⚠️ get_contract_spec fallback: {e}")
         return spec
 
-    def _try_order(self, url: str, variants: list[dict]) -> str:
-        """
-        variants를 순차 시도. 성공하면 orderId 반환.
-        """
-        last_err = None
-        for body in variants:
-            try:
-                j = _req_post(url, body, signed=True)
-                oid = self._extract_order_id(j)
-                if oid:
-                    return str(oid)
-                try:
-                    o = (j.get("data") or {}).get("order") or {}
-                    oid = o.get("orderId") or o.get("orderID") or o.get("id")
-                except Exception:
-                    oid = None
-                if oid:
-                    return str(oid)
-                last_err = RuntimeError(f"missing orderId in response: {j}")
-            except Exception as e:
-                last_err = e
-                log(f"⚠️ order variant failed: {e}")
-                continue
-        raise last_err or RuntimeError("all order variants failed")
-
     # ----- Market / Quote -----
     def list_symbols(self) -> list[str]:
         """
@@ -463,7 +438,7 @@ class BingXClient:
             variants.append(v)
         variants.append(base)
 
-        return self._try_order(url, variants)
+        return
 
     def place_limit(self, symbol: str, side: str, qty: float, price: float,
                     reduce_only: bool=False, position_side: str|None=None,
@@ -518,7 +493,7 @@ class BingXClient:
             variants.append(v)
         variants.append(base)
 
-        return self._try_order(url, variants)
+        return
 
     def cancel_order(self, symbol: str, order_id: str) -> bool:
         url = f"{BASE}/openApi/swap/v2/trade/order"
