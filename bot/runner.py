@@ -130,25 +130,25 @@ class BotRunner:
         - 기존 TP가 살아있고 변화가 미미하면 유지(데드밴드)
         """
         tick = 10 ** (-pp) if pp > 0 else 0.01
-        min_allowed = max(float(min_qty or 0.0), float(step or 0.0), tick)
+        min_qty_allowed = max(float(min_qty or 0.0), float(step or 0.0))
 
         qty_now = float(self.state.position_qty or 0.0)
-        if qty_now < min_allowed:
+        if qty_now < (min_qty_allowed*0.999):
             return
 
         entry = float(self.state.position_avg_price or 0.0)
         if entry <= 0:
-            try:
-                entry = float(self.client.get_mark_price(self.cfg.symbol))
-            except Exception:
-                entry = float(self.client.get_last_price(self.cfg.symbol))
+            return
 
+        # 4) TP 가격/수량 계산
         tp_price = tp_price_from_roi(entry, side, float(self.cfg.tp_percent), int(self.cfg.leverage), pp)
-        tp_qty = floor_to_step(qty_now, float(step or 1.0))
-        if tp_qty < min_allowed:
-            tp_qty = min_allowed
         if not (tp_price and tp_price > 0):
             return
+
+        tp_qty = floor_to_step(qty_now, float(step or 1.0))
+        # (a) 최소 수량 보장 + (b) 보유 수량 초과 금지
+        tp_qty = max(tp_qty, min_qty_allowed)
+        tp_qty = min(tp_qty, qty_now)
 
         price_changed = True
         qty_changed = True
