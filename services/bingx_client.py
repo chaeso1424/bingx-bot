@@ -550,12 +550,20 @@ class BingXClient:
     def cancel_order(self, symbol: str, order_id: str) -> bool:
         url = f"{BASE}/openApi/swap/v2/trade/order"
         try:
-            _req_delete(url, {"symbol": symbol, "orderId": int(order_id),
-                             "recvWindow": 60000, "timestamp": _ts()}, signed=True)
+            _req_delete(
+                url,
+                {"symbol": symbol, "orderId": int(order_id), "recvWindow": 60000, "timestamp": _ts()},
+                signed=True,
+            )
             return True
         except Exception as e:
+            msg = str(e)
+            # 80018(이미 존재/존재하지 않음 등) → 로그 없이 무시
+            if "80018" in msg:
+                return False
             log(f"⚠️ cancel_order: {e}")
             return False
+
 
     def open_orders(self, symbol: str) -> list[dict]:
         """열려있는 주문 목록"""
