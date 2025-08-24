@@ -114,31 +114,49 @@ class BotRunner:
         self.state.position_qty = qty
 
     def _cancel_tracked_limits(self) -> None:
-        try:
-            # 1) 추적 리밋 취소
-            for oid in list(self.state.open_limit_ids):
-                try:
-                    self.client.cancel_order(self.cfg.symbol, oid)
-                except Exception as e:
+        # 1) 추적 리밋 취소
+        for oid in list(self.state.open_limit_ids):
+            try:
+                self.client.cancel_order(self.cfg.symbol, oid)
+            except Exception as e:
+                msg = str(e).lower()
+                # 이미 체결/취소/없음은 무시
+                if any(x in msg for x in ("80018", "not exist", "does not exist", "unknown order", "filled", "canceled", "cancelled")):
+                    log(f"ℹ️ 건너뜀(이미 정리됨): {oid}")
+                else:
                     log(f"⚠️ 리밋 취소 실패: {oid} {e}")
 
-            # 2) 해당 심볼 오픈오더 확인
-            open_orders = self.client.open_orders(self.cfg.symbol)
-            if open_orders:
-                for o in open_orders:
-                    oid = o.get("orderId")
-                    if oid:
-                        try:
-                            self.client.cancel_order(self.cfg.symbol, oid)
-                        except Exception as e:
-                            log(f"⚠️ 오픈오더 취소 실패: {oid} {e}")
-
+        # 2) 심볼 오픈오더 확인
+        try:
+            open_orders = self.client.open_orders(self.cfg.symbol) or []
         except Exception as e:
-            log(f"⚠️ 오더 정리 중 오류: {e}")
+            log(f"⚠️ 오픈오더 조회 실패: {e}")
+            self.state.open_limit_ids.clear()
+            return
+
+        # 2-1) 오픈오더가 없으면 → clear 후 종료
+        if not open_orders:
+            self.state.open_limit_ids.clear()
+            return
+
+        # 2-2) 오픈오더가 있으면 → 가능한 것만 취소
+        seen = set(self.state.open_limit_ids)  # 방금 취소 시도한 것 재시도 방지
+        for o in open_orders:
+            oid = o.get("orderId") or o.get("orderID") or o.get("id")
+            if not oid or oid in seen:
+                continue
+            try:
+                self.client.cancel_order(self.cfg.symbol, oid)
+            except Exception as e:
+                msg = str(e).lower()
+                # 체결/취소/미존재는 무시(80018 포함)
+                if any(x in msg for x in ("80018", "not exist", "does not exist", "unknown order", "filled", "canceled", "cancelled")):
+                    log(f"ℹ️ 건너뜀(이미 정리됨): {oid}")
+                else:
+                    log(f"⚠️ 오픈오더 취소 실패: {oid} {e}")
 
         # 3) 최종 clear
         self.state.open_limit_ids.clear()
-
 
     # ---------- main loop ----------
     def _run(self) -> None:
@@ -386,6 +404,9 @@ class BotRunner:
                                 tp_alive = True
                                 break
 
+                    # while 루프 시작부 등, 각 사이클마다 초기화
+                    did_cleanup = False  # 이번 사이클에서 오더/TP 정리를 했는지 표시
+
                     # ----- 종료 판정 (연속 N회 + TP 미생존 + 이중확인) -----
                     tick = 10 ** (-pp) if pp > 0 else 0.01
                     min_allowed = max(float(min_qty or 0.0), float(step or 0.0))  # 수량 기준만
@@ -395,21 +416,27 @@ class BotRunner:
                         zero_streak += 1
                     else:
                         zero_streak = 0
+
                     really_closed = (zero_streak >= CLOSE_ZERO_STREAK) and (not tp_alive)
                     if really_closed:
                         try:
                             chk_avg, chk_qty = self.client.position_info(self.cfg.symbol, self.cfg.side)
                         except Exception:
                             chk_avg, chk_qty = 0.0, 0.0
+
                         if float(chk_qty or 0.0) < zero_eps:
-                            # 포지션 완전 청산 → DCA/TP 전부 정리
-                            self._cancel_tracked_limits()
-                            if self.state.tp_order_id:
-                                try:
-                                    self.client.cancel_order(self.cfg.symbol, self.state.tp_order_id)
-                                except Exception:
-                                    pass
-                                self.state.tp_order_id = None
+                            # ✅ 포지션 완전 청산 → DCA/TP 전부 정리 (이번 사이클 최초 1회만)
+                            if not did_cleanup:
+                                self._cancel_tracked_limits()
+                                if self.state.tp_order_id:
+                                    try:
+                                        self.client.cancel_order(self.cfg.symbol, self.state.tp_order_id)
+                                    except Exception:
+                                        pass
+                                    self.state.tp_order_id = None
+                                self.state.reset_orders()
+                                did_cleanup = True
+
                             log("✅ 포지션 종료 확정(연속검증+이중확인) → 대기")
                             break
                         else:
@@ -525,15 +552,17 @@ class BotRunner:
                 if not self.state.repeat_mode:
                     break
                 else:
-                    # 남은 오더 안전정리(attach 여부와 무관하게 전부 정리)
-                    self._cancel_tracked_limits()
-                    if self.state.tp_order_id:
-                        try:
-                            self.client.cancel_order(self.cfg.symbol, self.state.tp_order_id)
-                        except Exception:
-                            pass
-                        self.state.tp_order_id = None
-                    self.state.reset_orders()
+                    # 반복 진입 전 정리: 위에서 이미 정리했다면 스킵
+                    if not did_cleanup:
+                        self._cancel_tracked_limits()
+                        if self.state.tp_order_id:
+                            try:
+                                self.client.cancel_order(self.cfg.symbol, self.state.tp_order_id)
+                            except Exception:
+                                pass
+                            self.state.tp_order_id = None
+                        self.state.reset_orders()
+                        did_cleanup = True
 
                     delay = max(0, RESTART_DELAY_SEC)
                     if delay > 0:
