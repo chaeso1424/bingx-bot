@@ -490,6 +490,8 @@ class BingXClient:
             variants.append(v)
         variants.append(base)
 
+        time.sleep(0.5)
+
         return self._try_order(url, variants)
 
     def place_limit(self, symbol: str, side: str, qty: float, price: float,
@@ -544,6 +546,8 @@ class BingXClient:
             v["closePosition"] = "true"   # ← 문자열
             variants.append(v)
         variants.append(base)
+
+        time.sleep(0.5)
 
         return self._try_order(url, variants)
 

@@ -126,6 +126,8 @@ class BotRunner:
                 else:
                     log(f"⚠️ 리밋 취소 실패: {oid} {e}")
 
+        time.sleep(1.0)  # 취소 반영 대기
+
         # 2) 심볼 오픈오더 확인
         try:
             open_orders = self.client.open_orders(self.cfg.symbol) or []
