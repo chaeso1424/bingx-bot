@@ -578,7 +578,14 @@ class BotRunner:
                     log(" 재시작")
                     continue
         except Exception as e:
-            log(f"❌ 런타임 오류: {e}")
+            # 예외 발생 시 봇을 멈추지 말고 짧게 대기 후 상위 루프 재시작
+            try:
+                log(f"⚠️ 런타임 오류(자동복구 대기): {e}")
+            except Exception:
+                pass
+            time.sleep(3.0)
+            return self._run()   # 다시 실행 (재귀적으로 복구)
+
         finally:
             self.state.running = False
             log("⏹️ 봇 종료")

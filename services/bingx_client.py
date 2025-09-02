@@ -23,6 +23,29 @@ API_SECRET = os.getenv("BINGX_API_SECRET", "")
 BASE = os.getenv("BINGX_BASE", "https://open-api.bingx.com")
 POSITION_MODE = os.getenv("BINGX_POSITION_MODE", "HEDGE").upper()  # HEDGE or ONEWAY
 
+# === Resilience settings ===
+# 재시도 횟수 / 간격은 환경변수로 조절 가능
+MAX_RETRIES = int(os.getenv("BINGX_MAX_RETRIES", "3"))
+RETRY_DELAY = float(os.getenv("BINGX_RETRY_DELAY", "1.0"))
+
+def _should_retry(err: Exception) -> bool:
+    """네트워크·게이트웨이 일시 오류만 재시도"""
+    s = str(err).lower()
+    hints = (
+        "timed out",
+        "timeout",
+        "temporarily unavailable",
+        "service temporarily unavailable",
+        "503",
+        "bad gateway",
+        "gateway time-out",
+        "connection aborted",
+        "connection reset",
+        "read timed out",
+        "max retries",
+    )
+    return any(h in s for h in hints)
+
 # ---------- low-level utils ----------
 def _ts():
     return int(time.time() * 1000)
@@ -57,56 +80,112 @@ def _coerce_params(d: dict | None) -> dict:
 
 def _req_get(url: str, params: dict | None = None, signed: bool = False) -> dict:
     params = params or {}
+    last_err = None
+
+    # 사인 파라미터 전처리
     if signed:
-        params = _coerce_params(params)          # ← 추가
-        qs = _sign(params)
-        # increased timeouts to mitigate read timeout errors
-        r = requests.get(url + "?" + qs, headers=_headers(), timeout=(5, 60))
-    else:
-        # increased timeouts to mitigate read timeout errors
-        r = requests.get(url, params=params, headers=_headers(), timeout=(5, 60))
-    try:
-        j = r.json()
-    except Exception:
-        r.raise_for_status()
-        raise
-    code = str(j.get("code", "0"))
-    if code != "0":
-        msg = j.get("msg") or j
-        raise RuntimeError(f"BingX error @GET {url}: {code} {msg}")
-    return j
+        params_signed = _coerce_params(params)
+        qs = _sign(params_signed)
+
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            if signed:
+                r = requests.get(url + "?" + qs, headers=_headers(), timeout=(5, 60))
+            else:
+                r = requests.get(url, params=params, headers=_headers(), timeout=(5, 60))
+
+            try:
+                j = r.json()
+            except Exception:
+                r.raise_for_status()
+                j = {}
+
+            code = str(j.get("code", "0"))
+            if code != "0":
+                msg = j.get("msg") or j
+                raise RuntimeError(f"BingX error @GET {url}: {code} {msg}")
+            return j
+        except Exception as e:
+            last_err = e
+            if attempt < MAX_RETRIES and _should_retry(e):
+                try:
+                    from utils.logging import log
+                    log(f"⚠️ _req_get retry {attempt}/{MAX_RETRIES-1}: {e}")
+                except Exception:
+                    pass
+                time.sleep(RETRY_DELAY)
+                continue
+            break
+
+    raise last_err
 
 def _req_delete(url: str, params: dict | None = None, signed: bool = False) -> dict:
     params = params or {}
+    last_err = None
+
     if signed:
-        params = _coerce_params(params)          # ← 추가
-        qs = _sign(params)
-        # increased timeouts to mitigate read timeout errors
-        r = requests.delete(url + "?" + qs, headers=_headers(form=True), timeout=(5, 60))
-    else:
-        # increased timeouts to mitigate read timeout errors
-        r = requests.delete(url, params=params, headers=_headers(form=False), timeout=(5, 60))
-    j = r.json()
-    code = str(j.get("code", "0"))
-    if code != "0":
-        raise RuntimeError(f"BingX error @DELETE {url}: {code} {j.get('msg')}")
-    return j
+        params_signed = _coerce_params(params)
+        qs = _sign(params_signed)
+
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            if signed:
+                r = requests.delete(url + "?" + qs, headers=_headers(form=True), timeout=(5, 60))
+            else:
+                r = requests.delete(url, params=params, headers=_headers(form=False), timeout=(5, 60))
+
+            j = r.json()
+            code = str(j.get("code", "0"))
+            if code != "0":
+                raise RuntimeError(f"BingX error @DELETE {url}: {code} {j.get('msg')}")
+            return j
+        except Exception as e:
+            last_err = e
+            if attempt < MAX_RETRIES and _should_retry(e):
+                try:
+                    from utils.logging import log
+                    log(f"⚠️ _req_delete retry {attempt}/{MAX_RETRIES-1}: {e}")
+                except Exception:
+                    pass
+                time.sleep(RETRY_DELAY)
+                continue
+            break
+
+    raise last_err
 
 def _req_post(url: str, body: dict | None = None, signed: bool = False) -> dict:
     body = body or {}
+    last_err = None
+
     if signed:
-        body = _coerce_params(body)              # ← 추가
-        payload = _sign(body)                    # querystring + signature
-        # increased timeouts to mitigate read timeout errors
-        r = requests.post(url, data=payload, headers=_headers(form=True), timeout=(5, 60))
-    else:
-        # increased timeouts to mitigate read timeout errors
-        r = requests.post(url, json=body, headers=_headers(form=False), timeout=(5, 60))
-    j = r.json()
-    code = str(j.get("code", "0"))
-    if code != "0":
-        raise RuntimeError(f"BingX error @POST {url}: {code} {j.get('msg')}")
-    return j
+        body_signed = _coerce_params(body)
+        payload = _sign(body_signed)  # querystring + signature
+
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            if signed:
+                r = requests.post(url, data=payload, headers=_headers(form=True), timeout=(5, 60))
+            else:
+                r = requests.post(url, json=body, headers=_headers(form=False), timeout=(5, 60))
+
+            j = r.json()
+            code = str(j.get("code", "0"))
+            if code != "0":
+                raise RuntimeError(f"BingX error @POST {url}: {code} {j.get('msg')}")
+            return j
+        except Exception as e:
+            last_err = e
+            if attempt < MAX_RETRIES and _should_retry(e):
+                try:
+                    from utils.logging import log
+                    log(f"⚠️ _req_post retry {attempt}/{MAX_RETRIES-1}: {e}")
+                except Exception:
+                    pass
+                time.sleep(RETRY_DELAY)
+                continue
+            break
+
+    raise last_err
 
 # ---------- high-level client ----------
 class BingXClient:
@@ -276,9 +355,15 @@ class BingXClient:
                 last_err = RuntimeError(f"missing orderId in response (variant#{i+1})")
 
             except Exception as e:
-                # 요청 자체 실패 등 예외는 그대로 기록 후 다음 variant
+                # 요청 실패: 80001(잔액부족)은 경고 대신 정보 로그로 전환
                 last_err = e
-                log(f"⚠️ order variant#{i+1} failed: {e}")
+                s = str(e).lower()
+                if ("80001" in s) or ("insufficient" in s):
+                    from utils.logging import log
+                    log(f"ℹ️ order variant#{i+1} skipped (insufficient): {e}")
+                else:
+                    from utils.logging import log
+                    log(f"⚠️ order variant#{i+1} failed: {e}")
                 continue
 
         # 모든 시도 실패
@@ -581,9 +666,21 @@ class BingXClient:
             return []
 
     def position_info(self, symbol: str, side: str) -> tuple[float, float]:
-        """현재 포지션 (평단가, 수량). 없으면 (0.0, 0.0)"""
+        """현재 포지션 (평단가, 수량). 없으면 (0.0, 0.0).
+
+        네트워크/게이트웨이 오류 시 (0.0, 0.0)으로 폴백하여 상위 루프가 멈추지 않도록 함.
+        """
         url = f"{BASE}/openApi/swap/v2/user/positions"
-        j = _req_get(url, {"symbol": symbol, "recvWindow": 60000, "timestamp": _ts()}, signed=True)
+        try:
+            j = _req_get(url, {"symbol": symbol, "recvWindow": 60000, "timestamp": _ts()}, signed=True)
+        except Exception as e:
+            try:
+                from utils.logging import log
+                log(f"⚠️ position_info failed: {e}")
+            except Exception:
+                pass
+            return 0.0, 0.0
+
         arr = j.get("data", [])
         want = "LONG" if str(side).upper() == "BUY" else "SHORT"
 
@@ -610,7 +707,7 @@ class BingXClient:
                     entry = float(v)
                     if entry > 0:
                         break
-                except:
+                except Exception:
                     pass
 
         qty_keys = ["positionAmt", "positionAmount", "quantity", "positionQty", "positionSize", "amount", "qty"]
@@ -622,7 +719,7 @@ class BingXClient:
                     qty = abs(float(v))
                     if qty > 0:
                         break
-                except:
+                except Exception:
                     pass
 
         return entry, qty
