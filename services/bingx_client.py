@@ -662,7 +662,17 @@ class BingXClient:
             data = j.get("data", [])
             return data if isinstance(data, list) else data.get("orders", [])
         except Exception as e:
-            log(f"⚠️ open_orders: {e}")
+            s = str(e).lower()
+            if "100421" in s or "timestamp" in s:
+                # ⏱️ fresh timestamp로 1회 빠른 재시도
+                try:
+                    j = _req_get(url, {"symbol": symbol, "recvWindow": 60000, "timestamp": _ts()}, signed=True)
+                    data = j.get("data", [])
+                    return data if isinstance(data, list) else data.get("orders", [])
+                except Exception as e2:
+                    log(f"⚠️ open_orders(ts retry): {e2}")
+            else:
+                log(f"⚠️ open_orders: {e}")
             return []
 
     def position_info(self, symbol: str, side: str) -> tuple[float, float]:
