@@ -200,10 +200,16 @@ class BotRunner:
                 # 0) 가용 USDT 체크 (attach 모드면 패스 가능)
                 try:
                     av = float(self.client.get_available_usdt())
+                    if av < 0.99:  # 1차 조회 결과가 0에 가까움
+                        log("⚠️ 가용 USDT 0 → 재측정 시도")
+                        time.sleep(1)  # 1초 대기 후 재조회
+                        av = float(self.client.get_available_usdt())
                 except Exception as e:
                     log(f"❌ 가용잔고 조회 실패: {e}")
                     av = 0.0
+
                 budget = sum(float(usdt) for _, usdt in self.cfg.dca_config)
+
                 if av < 0.99 and not attach_mode:
                     log("⛔ 가용 USDT 없음 → 종료")
                     break
