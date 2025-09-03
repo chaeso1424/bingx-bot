@@ -7,6 +7,7 @@ from models.config import BotConfig
 from models.state import BotState
 from services.bingx_client import BingXClient
 import os
+import time
 
 # ===== 운영 파라미터 =====
 RESTART_DELAY_SEC = int(os.getenv("RESTART_DELAY_SEC", "60"))   # TP 후 다음 사이클 대기
