@@ -26,7 +26,7 @@ POSITION_MODE = os.getenv("BINGX_POSITION_MODE", "HEDGE").upper()  # HEDGE or ON
 # === Resilience settings ===
 # 재시도 횟수 / 간격은 환경변수로 조절 가능
 MAX_RETRIES = int(os.getenv("BINGX_MAX_RETRIES", "3"))
-RETRY_DELAY = float(os.getenv("BINGX_RETRY_DELAY", "1.0"))
+RETRY_DELAY = float(os.getenv("BINGX_RETRY_DELAY", "30"))
 
 def _should_retry(err: Exception) -> bool:
     """네트워크·게이트웨이 일시 오류만 재시도"""
@@ -652,10 +652,12 @@ class BingXClient:
                 return False
             log(f"⚠️ cancel_order: {e}")
             return False
+        
 
 
     def open_orders(self, symbol: str) -> list[dict]:
         """열려있는 주문 목록"""
+        import time
         url = f"{BASE}/openApi/swap/v2/trade/openOrders"
         try:
             j = _req_get(url, {"symbol": symbol, "recvWindow": 60000, "timestamp": _ts()}, signed=True)
@@ -664,7 +666,9 @@ class BingXClient:
         except Exception as e:
             s = str(e).lower()
             if "100421" in s or "timestamp" in s:
-                # ⏱️ fresh timestamp로 1회 빠른 재시도
+                # ⏱️ fresh timestamp로 1회 재시도 (대기 추가)
+                log("⚠️ open_orders timestamp mismatch → 60초 대기 후 재시도")
+                time.sleep(60)  # ✅ 대기 추가
                 try:
                     j = _req_get(url, {"symbol": symbol, "recvWindow": 60000, "timestamp": _ts()}, signed=True)
                     data = j.get("data", [])
@@ -674,6 +678,7 @@ class BingXClient:
             else:
                 log(f"⚠️ open_orders: {e}")
             return []
+
 
     def position_info(self, symbol: str, side: str) -> tuple[float, float]:
         """현재 포지션 (평단가, 수량). 없으면 (0.0, 0.0).
