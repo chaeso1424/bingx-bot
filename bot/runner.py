@@ -283,15 +283,34 @@ class BotRunner:
                     if not oid:
                         raise RuntimeError("market order failed: no orderId")
                     log(f" 1차 시장가 진입 주문: {oid} (투입≈{first_usdt} USDT, qty={qty})")
+                    time.sleep(1)  # ← 거래소 포지션 데이터 반영 대기
+                    self._refresh_position()  # → state.position_avg_price, state.position_qty 갱신
+
+                    # ★ 기준가 확정: 우선 평단가 → 마크 → 라스트
+                    base_price = float(self.state.position_avg_price or 0.0)
+                    if base_price <= 0:
+                        try:
+                            base_price = float(self.client.get_mark_price(self.cfg.symbol))
+                        except Exception:
+                            base_price = float(self.client.get_last_price(self.cfg.symbol))
+                        log(f"⚠️ avg_price=0 → fallback base_price={base_price} (DCA initial only)")
 
                     # 3) 나머지 DCA 리밋 깔기
                     entry_pos_side = "LONG" if side == "BUY" else "SHORT"
                     cumulative = 0.0
                     self.state.open_limit_ids.clear()
+
                     for i, (gap_pct, usdt_amt) in enumerate(self.cfg.dca_config[1:], start=2):
                         cumulative += float(gap_pct)
-                        price = mark * (1 - cumulative / 100.0) if side == "BUY" else mark * (1 + cumulative / 100.0)
-                        price = float(f"{price:.{pp}f}")
+
+                        # ★ 롱은 기준가 아래, 숏은 기준가 위
+                        if side == "BUY":   # LONG
+                            price = base_price * (1 - cumulative / 100.0)
+                        else:               # SELL → SHORT
+                            price = base_price * (1 + cumulative / 100.0)
+
+                        price = float(f"{price:.{pp}f}") # 가격 정밀도 맞춤
+
                         target_notional = float(usdt_amt) * float(self.cfg.leverage)
                         raw_qty = target_notional / max(price * contract, 1e-12)
                         q = floor_to_step(raw_qty, step)

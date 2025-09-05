@@ -652,8 +652,6 @@ class BingXClient:
                 return False
             log(f"⚠️ cancel_order: {e}")
             return False
-        
-
 
     def open_orders(self, symbol: str) -> list[dict]:
         """열려있는 주문 목록"""
