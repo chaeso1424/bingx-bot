@@ -589,7 +589,7 @@ class BotRunner:
                 log(f"⚠️ 런타임 오류(자동복구 대기): {e}")
             except Exception:
                 pass
-            time.sleep(3.0)
+            time.sleep(300) # 5분 대기
             return self._run()   # 다시 실행 (재귀적으로 복구)
 
         finally:

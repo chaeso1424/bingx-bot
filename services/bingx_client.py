@@ -26,7 +26,7 @@ POSITION_MODE = os.getenv("BINGX_POSITION_MODE", "HEDGE").upper()  # HEDGE or ON
 # === Resilience settings ===
 # 재시도 횟수 / 간격은 환경변수로 조절 가능
 MAX_RETRIES = int(os.getenv("BINGX_MAX_RETRIES", "3"))
-RETRY_DELAY = float(os.getenv("BINGX_RETRY_DELAY", "30"))
+RETRY_DELAY = float(os.getenv("BINGX_RETRY_DELAY", "60"))
 
 def _should_retry(err: Exception) -> bool:
     """네트워크·게이트웨이 일시 오류만 재시도"""
