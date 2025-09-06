@@ -708,7 +708,7 @@ class BingXClient:
                 break
 
         if not pos:
-            return 0.0, 0.0, True
+            return 0.0, 0.0
 
         entry_keys = ["entryPrice", "avgPrice", "avgEntryPrice", "openPrice", "positionOpenPrice"]
         entry = 0.0

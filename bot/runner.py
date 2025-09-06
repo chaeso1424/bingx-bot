@@ -126,49 +126,6 @@ class BotRunner:
             # 실패면 상태값을 덮지 않음
             self._last_pos_ok = False
 
-    def _get_position_with_retry(self, symbol: str, side: str) -> tuple[float, float, bool]:
-        """
-        position_info 호출 재시도: 
-        1s → 10s → 60s → 300s 간격으로 최대 4회 시도.
-        성공 시 (avg, qty, True), 최종 실패 시 (0.0, 0.0, False).
-        """
-        retry_delays = [1, 10, 60, 300]  # 초 단위
-
-        last_err = None
-        for attempt, delay in enumerate(retry_delays, start=1):
-            try:
-                ret = self.client.position_info(symbol, side)
-                # 반환형 방어 (2-tuple 혹은 3-tuple)
-                if isinstance(ret, tuple) and len(ret) == 3:
-                    avg, qty, ok = ret
-                elif isinstance(ret, tuple) and len(ret) == 2:
-                    avg, qty = ret
-                    ok = True
-                else:
-                    raise RuntimeError(f"unexpected position_info return: {ret!r}")
-
-                if ok:
-                    return float(avg or 0.0), abs(float(qty or 0.0)), True
-            except Exception as e:
-                last_err = e
-                try:
-                    from utils.logging import log
-                    log(f"⚠️ position_info 예외({attempt}/{len(retry_delays)}): {e}")
-                except Exception:
-                    pass
-
-            # 마지막 시도 전까지만 sleep
-            if attempt < len(retry_delays):
-                time.sleep(delay)
-
-        try:
-            from utils.logging import log
-            log(f"❌ 포지션 조회 최종 실패: {last_err}")
-        except Exception:
-            pass
-        return 0.0, 0.0, False
-
-
 
     def _cancel_tracked_limits(self) -> None:
         # 1) 추적 리밋 취소
@@ -245,10 +202,12 @@ class BotRunner:
                 mark = float(self.client.get_mark_price(self.cfg.symbol))
 
                 # ---- 현재 포지션 파악(attach 모드 여부 선결정) ----
-                pre_avg, pre_qty, ok = self._get_position_with_retry(self.cfg.symbol, self.cfg.side)
-
+                try:
+                    pre_avg, pre_qty = self.client.position_info(self.cfg.symbol, self.cfg.side)
+                except Exception:
+                    pre_avg, pre_qty = 0.0, 0.0
                 min_live_qty = max(float(min_qty or 0.0), float(step or 0.0))
-                attach_mode = ok and (float(pre_qty) >= (min_live_qty * ZERO_EPS_FACTOR))
+                attach_mode = (float(pre_qty) >= (min_live_qty * ZERO_EPS_FACTOR))
                 # attach_mode 상태를 기록한다.
                 self._attach_mode = attach_mode
 
@@ -262,6 +221,8 @@ class BotRunner:
                 except Exception as e:
                     log(f"❌ 가용잔고 조회 실패: {e}")
                     av = 0.0
+
+                budget = sum(float(usdt) for _, usdt in self.cfg.dca_config)
 
                 if av < 0.99 and not attach_mode:
                     log("⛔ 가용 USDT 없음 → 종료")
