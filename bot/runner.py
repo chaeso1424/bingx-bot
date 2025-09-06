@@ -105,13 +105,70 @@ class BotRunner:
         return required_total, plan
 
     def _refresh_position(self) -> None:
-        """스티키 평균가: qty>0인데 avg=0이면 이전 avg 유지."""
         old_avg = float(self.state.position_avg_price or 0.0)
-        avg, qty = self.client.position_info(self.cfg.symbol, self.cfg.side)
-        if qty > 0 and (avg is None or avg <= 0) and old_avg > 0:
-            avg = old_avg
-        self.state.position_avg_price = avg
-        self.state.position_qty = qty
+        old_qty = float(self.state.position_qty or 0.0)
+        avg, qty, ok = self.client.position_info(self.cfg.symbol, self.cfg.side)
+
+        if ok:
+            if (qty is not None and qty > 0):
+                # avg=0일 때는 old_avg 유지
+                self.state.position_avg_price = avg if (avg and avg > 0) else old_avg
+            elif qty is not None and qty <= 0:
+                self.state.position_avg_price = 0.0
+
+            # qty도 sticky 처리하고 싶으면
+            self.state.position_qty = qty if qty is not None else old_qty
+
+            self._last_pos_ok = True
+            self._last_pos_ok_ts = time.time()
+
+        else:
+            # 실패면 상태값을 덮지 않음
+            self._last_pos_ok = False
+
+    def _get_position_with_retry(self, symbol: str, side: str) -> tuple[float, float, bool]:
+        """
+        position_info 호출 재시도: 
+        1s → 10s → 60s → 300s 간격으로 최대 4회 시도.
+        성공 시 (avg, qty, True), 최종 실패 시 (0.0, 0.0, False).
+        """
+        retry_delays = [1, 10, 60, 300]  # 초 단위
+
+        last_err = None
+        for attempt, delay in enumerate(retry_delays, start=1):
+            try:
+                ret = self.client.position_info(symbol, side)
+                # 반환형 방어 (2-tuple 혹은 3-tuple)
+                if isinstance(ret, tuple) and len(ret) == 3:
+                    avg, qty, ok = ret
+                elif isinstance(ret, tuple) and len(ret) == 2:
+                    avg, qty = ret
+                    ok = True
+                else:
+                    raise RuntimeError(f"unexpected position_info return: {ret!r}")
+
+                if ok:
+                    return float(avg or 0.0), abs(float(qty or 0.0)), True
+            except Exception as e:
+                last_err = e
+                try:
+                    from utils.logging import log
+                    log(f"⚠️ position_info 예외({attempt}/{len(retry_delays)}): {e}")
+                except Exception:
+                    pass
+
+            # 마지막 시도 전까지만 sleep
+            if attempt < len(retry_delays):
+                time.sleep(delay)
+
+        try:
+            from utils.logging import log
+            log(f"❌ 포지션 조회 최종 실패: {last_err}")
+        except Exception:
+            pass
+        return 0.0, 0.0, False
+
+
 
     def _cancel_tracked_limits(self) -> None:
         # 1) 추적 리밋 취소
@@ -188,12 +245,10 @@ class BotRunner:
                 mark = float(self.client.get_mark_price(self.cfg.symbol))
 
                 # ---- 현재 포지션 파악(attach 모드 여부 선결정) ----
-                try:
-                    pre_avg, pre_qty = self.client.position_info(self.cfg.symbol, self.cfg.side)
-                except Exception:
-                    pre_avg, pre_qty = 0.0, 0.0
+                pre_avg, pre_qty, ok = self._get_position_with_retry(self.cfg.symbol, self.cfg.side)
+
                 min_live_qty = max(float(min_qty or 0.0), float(step or 0.0))
-                attach_mode = (float(pre_qty) >= (min_live_qty * ZERO_EPS_FACTOR))
+                attach_mode = ok and (float(pre_qty) >= (min_live_qty * ZERO_EPS_FACTOR))
                 # attach_mode 상태를 기록한다.
                 self._attach_mode = attach_mode
 
@@ -207,8 +262,6 @@ class BotRunner:
                 except Exception as e:
                     log(f"❌ 가용잔고 조회 실패: {e}")
                     av = 0.0
-
-                budget = sum(float(usdt) for _, usdt in self.cfg.dca_config)
 
                 if av < 0.99 and not attach_mode:
                     log("⛔ 가용 USDT 없음 → 종료")
@@ -439,19 +492,45 @@ class BotRunner:
                     min_allowed = max(float(min_qty or 0.0), float(step or 0.0))  # 수량 기준만
                     zero_eps = min_allowed * ZERO_EPS_FACTOR
 
-                    if qty_now < zero_eps:
-                        zero_streak += 1
-                    else:
-                        zero_streak = 0
+                    # qty_now는 직전 _refresh_position() 결과.
+                    # _refresh_position에서 실패 시 이전값을 유지하도록 구현했다면,
+                    # 여기서는 마지막 "성공 판독" 시각을 기준으로 신뢰도 필터를 둔다.
+                    recent_ok = getattr(self, "_last_pos_ok", False)
+                    recent_ok_age = time.time() - getattr(self, "_last_pos_ok_ts", 0.0)
+                    RECENT_OK_MAX_AGE = 5.0  # 최근 5초 이내 성공 판독만 신뢰
 
-                    really_closed = (zero_streak >= CLOSE_ZERO_STREAK) and (not tp_alive)
+                    if recent_ok and recent_ok_age <= RECENT_OK_MAX_AGE:
+                        # 최근 판독이 신뢰 가능할 때만 zero_streak 카운팅
+                        if float(qty_now or 0.0) < zero_eps:
+                            zero_streak += 1
+                        else:
+                            zero_streak = 0
+                    else:
+                        # ▷ 최근 판독 신뢰 불가(혹은 플래그 미구현)인 경우에는
+                        #    즉시 한 번만 재조회해서 '진짜 0'인지 확인 후 카운팅
+                        try:
+                            _avg_tmp, _qty_tmp = self.client.position_info(self.cfg.symbol, self.cfg.side)
+                            if float(_qty_tmp or 0.0) < zero_eps:
+                                zero_streak += 1
+                            else:
+                                zero_streak = 0
+                        except Exception:
+                            # 판독 실패면 종료 카운팅을 올리지 않음 (거짓 종료 방지)
+                            pass
+
+                    # tp_alive는 "확정 False"일 때만 종료 후보로 인정(unknown 제외)
+                    really_closed = (zero_streak >= CLOSE_ZERO_STREAK) and (tp_alive is False)
+
                     if really_closed:
+                        # 최종 이중확인: position 재조회가 '성공'이어야 하고 qty<zero_eps 이어야 종료 확정
                         try:
                             chk_avg, chk_qty = self.client.position_info(self.cfg.symbol, self.cfg.side)
+                            ok2 = True
                         except Exception:
                             chk_avg, chk_qty = 0.0, 0.0
+                            ok2 = False
 
-                        if float(chk_qty or 0.0) < zero_eps:
+                        if ok2 and float(chk_qty or 0.0) < zero_eps:
                             # ✅ 포지션 완전 청산 → DCA/TP 전부 정리 (이번 사이클 최초 1회만)
                             if not did_cleanup:
                                 self._cancel_tracked_limits()
@@ -467,6 +546,7 @@ class BotRunner:
                             log("✅ 포지션 종료 확정(연속검증+이중확인) → 대기")
                             break
                         else:
+                            # 최종 확인에서 실패/불일치 → 오판 방지 위해 카운터 리셋
                             zero_streak = 0
 
                     # ===== TP 생존/동일 수량 검사 (ID와 무관하게 탐지)
