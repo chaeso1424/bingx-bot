@@ -7,7 +7,6 @@ import requests
 from urllib.parse import urlencode
 from utils.logging import log
 
-import os
 # --- force IPv4 only for urllib3/requests ---
 import socket
 try:
@@ -17,7 +16,6 @@ except Exception:
     pass
 
 SKIP_SETUP = os.getenv("SKIP_SETUP", "false").lower() == "true"
-
 API_KEY = os.getenv("BINGX_API_KEY", "")
 API_SECRET = os.getenv("BINGX_API_SECRET", "")
 BASE = os.getenv("BINGX_BASE", "https://open-api.bingx.com")
@@ -189,12 +187,14 @@ def _req_post(url: str, body: dict | None = None, signed: bool = False) -> dict:
 # ---------- high-level client ----------
 class BingXClient:
     def __init__(self):
-        self._spec_cache = {}
+        self._spec_cache: dict[str, dict] = {}
+        self._last_position: dict[tuple[str, str], tuple[float, float]] = {}
+
 
     def get_current_leverage(self, symbol: str, side: str) -> float | None:
         """
-        현재 심볼/사이드의 적용 레버리지(거래소 측 상태)를 조회.
-        HEDGE 모드면 positionSide별로 조회.
+        Return the current applied leverage for the given symbol/side.
+        HEDGE mode will query positionSide separately.
         """
         url = f"{BASE}/openApi/swap/v2/user/positions"
         j = _req_get(url, {"symbol": symbol, "recvWindow": 60000, "timestamp": _ts()}, signed=True)
@@ -209,7 +209,7 @@ class BingXClient:
             if lev is not None:
                 try:
                     return float(lev)
-                except:
+                except Exception:
                     pass
         return None
 
@@ -262,20 +262,19 @@ class BingXClient:
         return 4, 3
 
     def _round_to_precision(self, value: float, digits: int) -> float:
-        if digits < 0: digits = 0
+        if digits < 0:
+            digits = 0
         fmt = f"{{:.{digits}f}}"
         return float(fmt.format(value))
-
-    # BingXClient 클래스 안에 추가
+    
     def get_contract_spec(self, symbol: str) -> dict:
         """
-        /openApi/swap/v2/quote/contracts에서 심볼 스펙을 읽어온다.
-        반환:
-        - contractSize: 1계약당 기초자산 수량
-        - minQty: 최소 주문 수량
-        - qtyStep: 수량 스텝(증감 단위)
-        - pricePrecision, quantityPrecision
+        Read contract spec for a symbol. Returns a dict with contractSize, minQty,
+        qtyStep, pricePrecision, quantityPrecision.
         """
+        # If cached, return the cached spec
+        if symbol in self._spec_cache:
+            return self._spec_cache[symbol]
         spec = {
             "contractSize": 1.0,
             "minQty": 0.0,
@@ -305,9 +304,11 @@ class BingXClient:
                             "pricePrecision": pp,
                             "quantityPrecision": qp,
                         })
-                        return spec
+                        break
         except Exception as e:
             log(f"⚠️ get_contract_spec fallback: {e}")
+        # Cache and return
+        self._spec_cache[symbol] = spec
         return spec
 
     def _try_order(self, url: str, variants: list[dict]) -> str:
@@ -678,24 +679,24 @@ class BingXClient:
 
 
     def position_info(self, symbol: str, side: str) -> tuple[float, float]:
-        """현재 포지션 (평단가, 수량). 없으면 (0.0, 0.0).
-
-        네트워크/게이트웨이 오류 시 (0.0, 0.0)으로 폴백하여 상위 루프가 멈추지 않도록 함.
+        """
+        Return current position (entry/avg price, quantity). If no position exists,
+        returns (0.0, 0.0). Uses a sticky cache to avoid returning zero erroneously
+        on transient network/API failures.
         """
         url = f"{BASE}/openApi/swap/v2/user/positions"
+        cache_key = (str(symbol), str(side).upper())
         try:
             j = _req_get(url, {"symbol": symbol, "recvWindow": 60000, "timestamp": _ts()}, signed=True)
         except Exception as e:
+            # Transient failure: return cached position if available
             try:
-                from utils.logging import log
                 log(f"⚠️ position_info failed: {e}")
             except Exception:
                 pass
-            return 0.0, 0.0
-
+            return self._last_position.get(cache_key, (0.0, 0.0))
         arr = j.get("data", [])
         want = "LONG" if str(side).upper() == "BUY" else "SHORT"
-
         pos = None
         for p in arr if isinstance(arr, list) else []:
             if POSITION_MODE == "HEDGE":
@@ -706,10 +707,11 @@ class BingXClient:
             else:
                 pos = p
                 break
-
         if not pos:
+            # Update cache to reflect no position
+            self._last_position[cache_key] = (0.0, 0.0)
             return 0.0, 0.0
-
+        # Determine entry (avg price)
         entry_keys = ["entryPrice", "avgPrice", "avgEntryPrice", "openPrice", "positionOpenPrice"]
         entry = 0.0
         for k in entry_keys:
@@ -721,7 +723,7 @@ class BingXClient:
                         break
                 except Exception:
                     pass
-
+        # Determine quantity (absolute value)
         qty_keys = ["positionAmt", "positionAmount", "quantity", "positionQty", "positionSize", "amount", "qty"]
         qty = 0.0
         for k in qty_keys:
@@ -733,5 +735,6 @@ class BingXClient:
                         break
                 except Exception:
                     pass
-
+        # Update cache and return
+        self._last_position[cache_key] = (entry, qty)
         return entry, qty

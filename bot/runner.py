@@ -2,7 +2,7 @@
 import threading
 import time
 from utils.logging import log
-from utils.mathx import tp_price_from_roi, floor_to_step
+from utils.mathx import tp_price_from_roi, floor_to_step, ceil_to_step
 from models.config import BotConfig
 from models.state import BotState
 from services.bingx_client import BingXClient
@@ -302,15 +302,12 @@ class BotRunner:
 
                     for i, (gap_pct, usdt_amt) in enumerate(self.cfg.dca_config[1:], start=2):
                         cumulative += float(gap_pct)
-
                         # ★ 롱은 기준가 아래, 숏은 기준가 위
                         if side == "BUY":   # LONG
                             price = base_price * (1 - cumulative / 100.0)
                         else:               # SELL → SHORT
                             price = base_price * (1 + cumulative / 100.0)
-
                         price = float(f"{price:.{pp}f}") # 가격 정밀도 맞춤
-
                         target_notional = float(usdt_amt) * float(self.cfg.leverage)
                         raw_qty = target_notional / max(price * contract, 1e-12)
                         q = floor_to_step(raw_qty, step)
@@ -359,7 +356,8 @@ class BotRunner:
                                 entry = float(self.client.get_last_price(self.cfg.symbol))
                             log(f"⚠️ avg_price=0 → fallback entry={entry} (initial only)")
                         tp_price = tp_price_from_roi(entry, side, float(self.cfg.tp_percent), int(self.cfg.leverage), pp)
-                        tp_qty = floor_to_step(qty_now, float(step or 1.0))
+                        # Modified: round quantity up to avoid undersizing TP
+                        tp_qty = ceil_to_step(qty_now, float(step or 1.0))
                         if tp_qty < min_allowed:
                             tp_qty = min_allowed
                         if tp_price <= 0 or tp_qty <= 0:
@@ -438,19 +436,16 @@ class BotRunner:
                     tick = 10 ** (-pp) if pp > 0 else 0.01
                     min_allowed = max(float(min_qty or 0.0), float(step or 0.0))  # 수량 기준만
                     zero_eps = min_allowed * ZERO_EPS_FACTOR
-
                     if qty_now < zero_eps:
                         zero_streak += 1
                     else:
                         zero_streak = 0
-
                     really_closed = (zero_streak >= CLOSE_ZERO_STREAK) and (not tp_alive)
                     if really_closed:
                         try:
                             chk_avg, chk_qty = self.client.position_info(self.cfg.symbol, self.cfg.side)
                         except Exception:
                             chk_avg, chk_qty = 0.0, 0.0
-
                         if float(chk_qty or 0.0) < zero_eps:
                             # ✅ 포지션 완전 청산 → DCA/TP 전부 정리 (이번 사이클 최초 1회만)
                             if not did_cleanup:
@@ -463,7 +458,6 @@ class BotRunner:
                                     self.state.tp_order_id = None
                                 self.state.reset_orders()
                                 did_cleanup = True
-
                             log("✅ 포지션 종료 확정(연속검증+이중확인) → 대기")
                             break
                         else:
@@ -472,7 +466,6 @@ class BotRunner:
                     # ===== TP 생존/동일 수량 검사 (ID와 무관하게 탐지)
                     want_side = "SELL" if side == "BUY" else "BUY"
                     want_pos  = "LONG" if side == "BUY" else "SHORT"
-
                     tp_equal_exists = False
                     tp_equal_id = None
                     tp_equal_price = None
@@ -495,7 +488,6 @@ class BotRunner:
                             except Exception:
                                 tp_equal_price = None
                             break
-
                     # 동일 수량 TP가 이미 있으면 → 감시 모드로 스킵 (재발주 금지)
                     if tp_equal_exists:
                         if not tp_alive:
@@ -507,10 +499,8 @@ class BotRunner:
                             log(f"ℹ️ 기존 TP 채택: id={tp_equal_id}, qty≈{qty_now}")
                         continue
 
-
                     # ----- TP 재설정(데드밴드 + 쿨다운) -----
                     need_reset_tp = False
-
                     # 평단 대체는 entry_now를 덮어쓰지 말고 별도 변수로
                     eff_entry = entry_now if entry_now > 0 else float(last_entry or 0.0)
                     if not tp_alive:
@@ -518,35 +508,28 @@ class BotRunner:
                     else:
                         if qty_now >= min_allowed and eff_entry > 0:
                             ideal_price = tp_price_from_roi(eff_entry, side, float(self.cfg.tp_percent), int(self.cfg.leverage), pp)
-                            ideal_qty   = max(floor_to_step(qty_now, step), min_allowed)
-                            ideal_qty   = min(ideal_qty, qty_now)  # 보유 수량 초과 금지
-
+                            ideal_qty   = max(ceil_to_step(qty_now, step), min_allowed)
+                            # Note: do not cap ideal_qty to qty_now; reduce-only orders will ensure we don't exceed
                             if (last_entry is None) or (last_tp_price is None) or (last_tp_qty is None):
                                 need_reset_tp = True
                             elif (abs(eff_entry - last_entry) >= 2 * tick) or \
-                                (abs(ideal_price - last_tp_price) >= 2 * tick) or \
-                                (abs(ideal_qty - last_tp_qty) >= float(step or 1.0)):
+                                 (abs(ideal_price - last_tp_price) >= 2 * tick) or \
+                                 (abs(ideal_qty - last_tp_qty) >= float(step or 1.0)):
                                 need_reset_tp = True
-
                     if need_reset_tp:
                         now_ts = self._now()
                         if now_ts - last_tp_reset_ts < tp_reset_cooldown:
                             continue
-
                         if self.state.tp_order_id and tp_alive:
                             try:
                                 self.client.cancel_order(self.cfg.symbol, self.state.tp_order_id)
                                 self._wait_cancel(self.state.tp_order_id, timeout=2.5)
                             except Exception as e:
                                 log(f"⚠️ TP 취소 실패(무시): {e}")
-
                         if eff_entry <= 0 or qty_now < min_allowed:
                             continue
-
                         new_price = tp_price_from_roi(eff_entry, side, float(self.cfg.tp_percent), int(self.cfg.leverage), pp)
-                        new_qty   = max(floor_to_step(qty_now, step), min_allowed)
-                        new_qty   = min(new_qty, qty_now)  # 보유 수량 초과 금지
-
+                        new_qty   = max(ceil_to_step(qty_now, step), min_allowed)
                         new_side = "SELL" if side == "BUY" else "BUY"
                         new_pos  = "LONG" if side == "BUY" else "SHORT"
                         try:
@@ -564,7 +547,6 @@ class BotRunner:
                                 continue
                             else:
                                 raise
-
                         self.state.tp_order_id = str(new_id)
                         last_entry     = eff_entry
                         last_tp_price  = new_price
@@ -590,7 +572,6 @@ class BotRunner:
                             self.state.tp_order_id = None
                         self.state.reset_orders()
                         did_cleanup = True
-
                     delay = max(0, RESTART_DELAY_SEC)
                     if delay > 0:
                         log(f" 반복 모드 → {delay}초 대기 후 재시작")
@@ -610,7 +591,6 @@ class BotRunner:
                 pass
             time.sleep(300) # 5분 대기
             return self._run()   # 다시 실행 (재귀적으로 복구)
-
         finally:
             self.state.running = False
             log("⏹️ 봇 종료")
