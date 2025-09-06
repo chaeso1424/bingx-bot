@@ -90,9 +90,9 @@ def _req_get(url: str, params: dict | None = None, signed: bool = False) -> dict
     for attempt in range(1, MAX_RETRIES + 1):
         try:
             if signed:
-                r = requests.get(url + "?" + qs, headers=_headers(), timeout=(10, 60))
+                r = requests.get(url + "?" + qs, headers=_headers(), timeout=(5, 60))
             else:
-                r = requests.get(url, params=params, headers=_headers(), timeout=(10, 60))
+                r = requests.get(url, params=params, headers=_headers(), timeout=(5, 60))
 
             try:
                 j = r.json()
@@ -129,9 +129,9 @@ def _req_delete(url: str, params: dict | None = None, signed: bool = False) -> d
     for attempt in range(1, MAX_RETRIES + 1):
         try:
             if signed:
-                r = requests.delete(url + "?" + qs, headers=_headers(form=True), timeout=(10, 60))
+                r = requests.delete(url + "?" + qs, headers=_headers(form=True), timeout=(5, 60))
             else:
-                r = requests.delete(url, params=params, headers=_headers(form=False), timeout=(10, 60))
+                r = requests.delete(url, params=params, headers=_headers(form=False), timeout=(5, 60))
 
             j = r.json()
             code = str(j.get("code", "0"))
@@ -163,9 +163,9 @@ def _req_post(url: str, body: dict | None = None, signed: bool = False) -> dict:
     for attempt in range(1, MAX_RETRIES + 1):
         try:
             if signed:
-                r = requests.post(url, data=payload, headers=_headers(form=True), timeout=(10, 60))
+                r = requests.post(url, data=payload, headers=_headers(form=True), timeout=(5, 60))
             else:
-                r = requests.post(url, json=body, headers=_headers(form=False), timeout=(10, 60))
+                r = requests.post(url, json=body, headers=_headers(form=False), timeout=(5, 60))
 
             j = r.json()
             code = str(j.get("code", "0"))
@@ -691,7 +691,7 @@ class BingXClient:
                 log(f"⚠️ position_info failed: {e}")
             except Exception:
                 pass
-            return None, None, False  # ← 실패는 None/None, ok=False
+            return 0.0, 0.0
 
         arr = j.get("data", [])
         want = "LONG" if str(side).upper() == "BUY" else "SHORT"
@@ -734,4 +734,4 @@ class BingXClient:
                 except Exception:
                     pass
 
-        return entry, qty, True
+        return entry, qty
