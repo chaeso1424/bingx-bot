@@ -1,4 +1,3 @@
-# services/bingx_client.py
 import os
 import time
 import hmac
@@ -7,7 +6,6 @@ import requests
 from urllib.parse import urlencode
 from utils.logging import log
 
-# --- force IPv4 only for urllib3/requests ---
 import socket
 try:
     import urllib3.util.connection as urllib3_cn
