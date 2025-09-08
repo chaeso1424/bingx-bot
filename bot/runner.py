@@ -344,6 +344,7 @@ class BotRunner:
                     min_allowed = max(float(min_qty or 0.0), float(step or 0.0))
                     qty_now = float(self.state.position_qty or 0.0)
 
+
                     last_entry = None
                     last_tp_price = None
                     last_tp_qty = None
