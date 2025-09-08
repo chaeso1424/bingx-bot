@@ -2,7 +2,7 @@
 import threading
 import time
 from utils.logging import log
-from utils.mathx import tp_price_from_roi, floor_to_step, ceil_to_step
+from utils.mathx import tp_price_from_roi, floor_to_step, _safe_close_qty
 from models.config import BotConfig
 from models.state import BotState
 from services.bingx_client import BingXClient
@@ -259,6 +259,7 @@ class BotRunner:
                     last_tp_qty = self._last_tp_qty
                 else:
                     # 2) 1차 시장가 진입
+                    
                     first_usdt = float(self.cfg.dca_config[0][1])
                     target_notional = first_usdt * float(self.cfg.leverage)
                     raw_qty = target_notional / max(mark * contract, 1e-12)
@@ -340,7 +341,7 @@ class BotRunner:
                     # 4) 초기 TP 세팅
                     self._refresh_position()
                     tick = 10 ** (-pp) if pp > 0 else 0.01
-                    min_allowed = max(float(min_qty or 0.0), float(step or 0.0), tick)
+                    min_allowed = max(float(min_qty or 0.0), float(step or 0.0))
                     qty_now = float(self.state.position_qty or 0.0)
 
                     last_entry = None
@@ -357,7 +358,7 @@ class BotRunner:
                             log(f"⚠️ avg_price=0 → fallback entry={entry} (initial only)")
                         tp_price = tp_price_from_roi(entry, side, float(self.cfg.tp_percent), int(self.cfg.leverage), pp)
                         # Modified: round quantity up to avoid undersizing TP
-                        tp_qty = ceil_to_step(qty_now, float(step or 1.0))
+                        tp_qty = _safe_close_qty(qty_now, float(step or 1.0), min_allowed)
                         if tp_qty < min_allowed:
                             tp_qty = min_allowed
                         if tp_price <= 0 or tp_qty <= 0:
@@ -434,7 +435,7 @@ class BotRunner:
 
                     # ----- 종료 판정 (연속 N회 + TP 미생존 + 이중확인) -----
                     tick = 10 ** (-pp) if pp > 0 else 0.01
-                    min_allowed = max(float(min_qty or 0.0), float(step or 0.0))  # 수량 기준만
+                    min_allowed = max(float(min_qty or 0.0), float(step or 0.0))
                     zero_eps = min_allowed * ZERO_EPS_FACTOR
                     if qty_now < zero_eps:
                         zero_streak += 1
@@ -508,7 +509,7 @@ class BotRunner:
                     else:
                         if qty_now >= min_allowed and eff_entry > 0:
                             ideal_price = tp_price_from_roi(eff_entry, side, float(self.cfg.tp_percent), int(self.cfg.leverage), pp)
-                            ideal_qty   = max(ceil_to_step(qty_now, step), min_allowed)
+                            ideal_qty = _safe_close_qty(qty_now, step, min_allowed)
                             # Note: do not cap ideal_qty to qty_now; reduce-only orders will ensure we don't exceed
                             if (last_entry is None) or (last_tp_price is None) or (last_tp_qty is None):
                                 need_reset_tp = True
@@ -529,7 +530,7 @@ class BotRunner:
                         if eff_entry <= 0 or qty_now < min_allowed:
                             continue
                         new_price = tp_price_from_roi(eff_entry, side, float(self.cfg.tp_percent), int(self.cfg.leverage), pp)
-                        new_qty   = max(ceil_to_step(qty_now, step), min_allowed)
+                        new_qty   = _safe_close_qty(qty_now, step, min_allowed)
                         new_side = "SELL" if side == "BUY" else "BUY"
                         new_pos  = "LONG" if side == "BUY" else "SHORT"
                         try:
