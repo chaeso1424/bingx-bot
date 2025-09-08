@@ -52,14 +52,36 @@ def floor_to_step(value: float, step: float) -> float:
 
 
 def _safe_close_qty(qty_now: float, step: float, min_allowed: float) -> float:
-    # 미세한 부동소수 오차 여유
-    eps = min(step, 1e-12)
-    from utils.mathx import floor_to_step
-    q = floor_to_step(max(qty_now - eps, 0.0), step)
-    # 최소단위 미만이면 0으로 처리 (주문 생략)
-    if q < min_allowed:
+    from decimal import Decimal, getcontext, ROUND_FLOOR
+    getcontext().prec = 28
+
+    if step <= 0:
         return 0.0
-    return q
+
+    qd  = Decimal(str(qty_now))   # float 오차 방지
+    sd  = Decimal(str(step))
+    mind = Decimal(str(min_allowed))
+
+    # 최소단위 미만이면 스킵
+    if qd < mind:
+        return 0.0
+
+    # step 기준 스냅 (반올림 보정)
+    remainder = qd % sd
+    if remainder <= (sd / 2):
+        qd = qd - remainder
+    else:
+        qd = qd - remainder + sd
+
+    # 혹시라도 위쪽으로 스냅했는데 포지션 초과 방지 → 다시 floor
+    n = (qd / sd).to_integral_value(rounding=ROUND_FLOOR)
+    q = n * sd
+
+    if q < mind:
+        return 0.0
+
+    return float(q)
+
 
 def _round_to_tick(value: float, pp: int, mode: str = "DOWN") -> float:
     """
