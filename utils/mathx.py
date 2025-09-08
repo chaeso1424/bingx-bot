@@ -51,18 +51,15 @@ def floor_to_step(value: float, step: float) -> float:
     return math.floor(value / step) * step
 
 
-def ceil_to_step(value: float, step: float) -> float:
-    """
-    Round ``value`` up to the nearest multiple of ``step``.
-
-    For example, with ``value=1.23`` and ``step=0.1``, returns ``1.3``.
-    If ``step`` is zero or negative, returns ``value`` unchanged.
-    """
-    if step <= 0:
-        return value
-    import math
-    return math.ceil(value / step) * step
-
+def _safe_close_qty(qty_now: float, step: float, min_allowed: float) -> float:
+    # 미세한 부동소수 오차 여유
+    eps = min(step, 1e-12)
+    from utils.mathx import floor_to_step
+    q = floor_to_step(max(qty_now - eps, 0.0), step)
+    # 최소단위 미만이면 0으로 처리 (주문 생략)
+    if q < min_allowed:
+        return 0.0
+    return q
 
 def _round_to_tick(value: float, pp: int, mode: str = "DOWN") -> float:
     """
