@@ -344,9 +344,8 @@ class BotRunner:
                     min_allowed = max(float(min_qty or 0.0), float(step or 0.0))
                     qty_now = float(self.state.position_qty or 0.0)
 
-
                     last_entry = None
-                    last_tp_price = None
+                    last_tp_price = None   # ← 이름은 price지만 stopPrice(트리거)를 저장
                     last_tp_qty = None
 
                     if qty_now >= min_allowed:
@@ -357,50 +356,58 @@ class BotRunner:
                             except Exception:
                                 entry = float(self.client.get_last_price(self.cfg.symbol))
                             log(f"⚠️ avg_price=0 → fallback entry={entry} (initial only)")
-                        tp_price = tp_price_from_roi(entry, side, float(self.cfg.tp_percent), int(self.cfg.leverage), pp)
-                        # Modified: round quantity up to avoid undersizing TP
+
+                        # 트리거(stopPrice) 계산
+                        tp_stop = tp_price_from_roi(entry, side, float(self.cfg.tp_percent), int(self.cfg.leverage), pp)
+
+                        # 수량 스냅(미세 오차·최소단위 처리)
                         tp_qty = _safe_close_qty(qty_now, float(step or 1.0), min_allowed)
                         if tp_qty < min_allowed:
                             tp_qty = min_allowed
-                        if tp_price <= 0 or tp_qty <= 0:
-                            raise RuntimeError(f"TP invalid: price={tp_price}, qty={tp_qty}")
+
+                        if tp_stop <= 0 or tp_qty <= 0:
+                            raise RuntimeError(f"TP invalid: stop={tp_stop}, qty={tp_qty}")
+
                         tp_side = "SELL" if side == "BUY" else "BUY"
-                        tp_pos = "LONG" if side == "BUY" else "SHORT"
+                        tp_pos  = "LONG" if side == "BUY" else "SHORT"
                         new_tp_id: str | None = None
+
                         try:
-                            new_tp_id = self.client.place_limit(
+                            # ✅ 조건부 시장가 TP로 발주 (발동 시 MARKET 청산)
+                            new_tp_id = self.client.place_tp_market(
                                 self.cfg.symbol,
-                                tp_side,
-                                tp_qty,
-                                tp_price,
-                                reduce_only=True,
-                                position_side=tp_pos,
+                                side=tp_side,
+                                stop_price=tp_stop,      # ← price 대신 stopPrice만!
+                                qty=tp_qty,
+                                reduce_only=True,        # 신규 진입 방지
+                                position_side=tp_pos,    # HEDGE 모드 필수
                             )
                         except Exception as e:
                             if "80001" in str(e):
-                                # TP 주문 실패는 무시하고 계속 진행
-                                log(f"⚠️ 초기 TP 주문 실패: {e}")
+                                log(f"⚠️ 초기 TP 주문 실패: {e}")  # 실패는 무시하고 진행
                                 new_tp_id = None
                             else:
                                 raise
+
                         if new_tp_id:
                             self.state.tp_order_id = str(new_tp_id)
                             last_entry = entry
-                            last_tp_price = tp_price
+                            last_tp_price = tp_stop     # ← stopPrice 기록
                             last_tp_qty = tp_qty
-                            self._last_tp_price = tp_price
+                            self._last_tp_price = tp_stop
                             self._last_tp_qty = tp_qty
-                            log(f" TP 배치 완료: id={new_tp_id}, price={tp_price}, qty={tp_qty}, side={tp_side}/{tp_pos}")
+                            log(f"✅ TP(MKT) 배치 완료: id={new_tp_id}, stop={tp_stop}, qty={tp_qty}, side={tp_side}/{tp_pos}")
                         else:
                             log("ℹ️ 초기 TP 주문 생략")
                             last_entry = entry
-                            last_tp_price = tp_price
+                            last_tp_price = tp_stop
                             last_tp_qty = tp_qty
                     else:
                         log("ℹ️ 포지션 없음 또는 최소단위 미만 → TP 생략")
                         last_entry = None
                         last_tp_price = None
                         last_tp_qty = None
+
 
                 # ===== 5) 모니터링 루프 =====
                 tp_reset_cooldown = 3.0
@@ -509,15 +516,17 @@ class BotRunner:
                         need_reset_tp = (qty_now >= min_allowed and eff_entry > 0)
                     else:
                         if qty_now >= min_allowed and eff_entry > 0:
-                            ideal_price = tp_price_from_roi(eff_entry, side, float(self.cfg.tp_percent), int(self.cfg.leverage), pp)
-                            ideal_qty = _safe_close_qty(qty_now, step, min_allowed)
+                            # 지정가 가격이 아니라 TP 트리거(stopPrice)를 이상값으로 계산
+                            ideal_stop = tp_price_from_roi(eff_entry, side, float(self.cfg.tp_percent), int(self.cfg.leverage), pp)
+                            ideal_qty  = _safe_close_qty(qty_now, step, min_allowed)
                             # Note: do not cap ideal_qty to qty_now; reduce-only orders will ensure we don't exceed
                             if (last_entry is None) or (last_tp_price is None) or (last_tp_qty is None):
                                 need_reset_tp = True
                             elif (abs(eff_entry - last_entry) >= 2 * tick) or \
-                                 (abs(ideal_price - last_tp_price) >= 2 * tick) or \
-                                 (abs(ideal_qty - last_tp_qty) >= float(step or 1.0)):
+                                (abs(ideal_stop - last_tp_price) >= 2 * tick) or \
+                                (abs(ideal_qty - last_tp_qty) >= float(step or 1.0)):
                                 need_reset_tp = True
+
                     if need_reset_tp:
                         now_ts = self._now()
                         if now_ts - last_tp_reset_ts < tp_reset_cooldown:
@@ -530,18 +539,22 @@ class BotRunner:
                                 log(f"⚠️ TP 취소 실패(무시): {e}")
                         if eff_entry <= 0 or qty_now < min_allowed:
                             continue
-                        new_price = tp_price_from_roi(eff_entry, side, float(self.cfg.tp_percent), int(self.cfg.leverage), pp)
-                        new_qty   = _safe_close_qty(qty_now, step, min_allowed)
+
+                        # 트리거(stopPrice)와 수량 계산
+                        new_stop = tp_price_from_roi(eff_entry, side, float(self.cfg.tp_percent), int(self.cfg.leverage), pp)
+                        new_qty  = _safe_close_qty(qty_now, step, min_allowed)
                         new_side = "SELL" if side == "BUY" else "BUY"
                         new_pos  = "LONG" if side == "BUY" else "SHORT"
+
                         try:
-                            new_id = self.client.place_limit(
+                            # ✅ LIMIT 대신 조건부 시장가 TP 사용
+                            new_id = self.client.place_tp_market(
                                 self.cfg.symbol,
-                                new_side,
-                                new_qty,
-                                new_price,
-                                reduce_only=True,
-                                position_side=new_pos,
+                                side=new_side,            # 청산 방향
+                                stop_price=new_stop,      # 트리거 가격(= stopPrice)
+                                qty=new_qty,              # 일부/전량
+                                reduce_only=True,         # 신규 진입 방지
+                                position_side=new_pos,    # HEDGE 모드일 때 필수
                             )
                         except Exception as e:
                             msg = str(e)
@@ -549,14 +562,16 @@ class BotRunner:
                                 continue
                             else:
                                 raise
+
                         self.state.tp_order_id = str(new_id)
                         last_entry     = eff_entry
-                        last_tp_price  = new_price
+                        last_tp_price  = new_stop   # ← 이름은 price지만 "트리거(stop)"를 저장
                         last_tp_qty    = new_qty
-                        self._last_tp_price = new_price
+                        self._last_tp_price = new_stop
                         self._last_tp_qty   = new_qty
                         last_tp_reset_ts = now_ts
-                        log(f"♻️ TP 재설정: id={new_id}, price={new_price}, qty={new_qty}")
+                        log(f"♻️ TP 재설정(MKT): id={new_id}, stop={new_stop}, qty={new_qty}")
+
                 # 루프 탈출: repeat면 다시 반복
                 if self._stop:
                     break
