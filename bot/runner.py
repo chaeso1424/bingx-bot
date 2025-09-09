@@ -379,7 +379,6 @@ class BotRunner:
                                 side=tp_side,
                                 stop_price=tp_stop,      # ← price 대신 stopPrice만!
                                 qty=tp_qty,
-                                reduce_only=True,        # 신규 진입 방지
                                 position_side=tp_pos,    # HEDGE 모드 필수
                             )
                         except Exception as e:
@@ -553,7 +552,6 @@ class BotRunner:
                                 side=new_side,            # 청산 방향
                                 stop_price=new_stop,      # 트리거 가격(= stopPrice)
                                 qty=new_qty,              # 일부/전량
-                                reduce_only=True,         # 신규 진입 방지
                                 position_side=new_pos,    # HEDGE 모드일 때 필수
                             )
                         except Exception as e:

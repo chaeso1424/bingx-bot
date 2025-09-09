@@ -639,15 +639,13 @@ class BingXClient:
     def place_tp_market(self, symbol: str,
                         side: str|None,                 # 포지션 반대 방향(없으면 position_side로 자동결정)
                         stop_price: float,              # 트리거 가격 (필수)
-                        qty: float|None=None,           # 수량 지정 (None이면 closePosition로 전체 청산 가능)
-                        reduce_only: bool=True,         # TP는 기본적으로 청산 전용
+                        qty: float|None=None,           # 수량 지정 (None이면 closePosition로 전체 청산)
                         position_side: str|None=None,   # HEDGE 모드에서 LONG/SHORT 지정
                         close_position: bool=False      # True면 수량 대신 전체 청산
                         ) -> str:
         """
         TAKE_PROFIT_MARKET 조건부 시장가 익절 주문.
-        - HEDGE 모드: positionSide 필수(없으면 side/포지션 방향으로 추론)
-        - ONE-WAY 모드: reduceOnly 권장
+        - HEDGE 모드: positionSide 필수
         - close_position=True면 quantity 없이 전체 청산 (closePosition="true")
         """
         import math, time
@@ -656,7 +654,6 @@ class BingXClient:
         # --- stopPrice 검증/보정 ---
         if stop_price is None or float(stop_price) <= 0:
             raise RuntimeError("stop_price must be > 0 for TAKE_PROFIT_MARKET")
-        # 심볼 정밀도 가져와서 보기 좋게만 포맷(트리거는 서버가 내부 정밀도로 처리)
         pp, qp = self.get_symbol_filters(symbol)
         stop_price = float(f"{float(stop_price):.{max(pp,0)}f}")
 
@@ -696,31 +693,17 @@ class BingXClient:
         }
 
         if POSITION_MODE == "HEDGE":
-            # HEDGE: positionSide 필요
             ps = (position_side or "").upper()
             if not ps:
-                # side가 있으면 그 반대 방향이 포지션이라고 가정해 추론
-                # (ex. LONG 포지션 익절이면 side=SELL)
-                # 포지션 방향을 명확히 알 수 있으면 ps를 직접 인자로 주는 걸 권장
                 raise RuntimeError("HEDGE mode requires position_side (LONG/SHORT)")
             base["positionSide"] = ps
-
-            # side: 청산이므로 포지션 반대 방향이어야 함
             if side is None:
                 side = "SELL" if ps == "LONG" else "BUY"
             base["side"] = side.upper()
-
-            # reduceOnly 사용 가능(권장)
-            if reduce_only:
-                base["reduceOnly"] = True
-
         else:
-            # ONE-WAY: positionSide 금지, side만 사용(청산=반대방향)
             if side is None:
                 raise RuntimeError("ONE-WAY mode requires explicit side (BUY/SELL)")
             base["side"] = side.upper()
-            if reduce_only:
-                base["reduceOnly"] = True
 
         # --- quantity / closePosition 분기 ---
         variants = []
@@ -737,6 +720,7 @@ class BingXClient:
 
         time.sleep(0.5)
         return self._try_order(url, variants)
+
 
     def cancel_order(self, symbol: str, order_id: str) -> bool:
         url = f"{BASE}/openApi/swap/v2/trade/order"
